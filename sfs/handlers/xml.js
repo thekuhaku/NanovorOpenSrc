@@ -138,12 +138,10 @@ function handleXmlMessage(socket, message) {
                     console.log('Sending system login response:', sysLoginResponse.replace(/\x00/g, '\\x00'));
                     socket.write(sysLoginResponse);
 
-                    // Add a small delay before sending the extension response to ensure proper sequencing
+                    // Add a small delay before sending the extension response to ensure proper sequencing.
+                    // logOK sends only _cmd, chatRoomName, username.
                     setTimeout(() => {
-                        // After successful system login, send the logOK message from the loginXt extension
-                        // This is what the client expects to receive to finalize the login process
-                        const user = users[socket.userId] || {}; // Use socket.userId instead of session.accountId to ensure consistency
-                        const loginOkResponse = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"logOK","username":"${socket.userName}","chatRoomName":"Lobby","avatarId":${user.avatarId || 1},"nmp":${user.nmp || 0}}]]></body></msg>\x00`;
+                        const loginOkResponse = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"logOK","chatRoomName":"Lobby","username":"${socket.userName}"}]]></body></msg>\x00`;
                         console.log('Sending extension login response:', loginOkResponse.replace(/\x00/g, '\\x00'));
                         socket.write(loginOkResponse);
 
