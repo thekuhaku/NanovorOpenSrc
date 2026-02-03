@@ -28,9 +28,9 @@ function handleExtensionCommand(socket, extension, command, params) {
                     response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"avatarUpdated"}]]></body></msg>\x00`;
                     break;
                 case 'getBuddyAvatar':
-                    // Return user's avatar info
-                    const user = users[socket.userId] || {};
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"buddyAvatarData","avatarId":${user.avatarId || 1},"nmp":${user.nmp || 0}}]]></body></msg>\x00`;
+                    // _cmd "responseBuddyAvatar" with userRefId, avatarId, nmp
+                    const buddyUser = users[socket.userId] || {};
+                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"responseBuddyAvatar","userRefId":"${socket.userId}","avatarId":${buddyUser.avatarId || 1},"nmp":${buddyUser.nmp || 0}}]]></body></msg>\x00`;
                     break;
                 case 'getUserData':
                 case 'syncUserData':
@@ -132,13 +132,11 @@ function handleExtensionCommand(socket, extension, command, params) {
                     }
                     response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"emRemoved"}]]></body></msg>\x00`;
                     break;
-                case 'initialize':  // Likely initial command sent by client to loginXt extension
-                case 'login':       // Another possibility for initial login command to extension
-                case 'init':        // Another possible initialization command
-                    // Send logOK as response to initial extension request
-                    // For new users, ensure nmp and gamesPlayed are 0 to trigger NewUserState
-                    const userData1 = users[socket.userId] || {};
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"logOK","username":"${socket.userName || 'n'}","chatRoomName":"Lobby","avatarId":${userData1.avatarId || 1},"nmp":${userData1.nmp || 0},"gamesPlayed":${userData1.gamesPlayed || 0}}]]></body></msg>\x00`;
+                case 'initialize':  // Initial command sent by client to loginXt extension
+                case 'login':
+                case 'init':
+                    // logOK sends only _cmd, chatRoomName, username
+                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"logOK","chatRoomName":"Lobby","username":"${socket.userName || 'n'}"}]]></body></msg>\x00`;
                     break;
                 default:
                     // For unknown commands, return unknown command response
