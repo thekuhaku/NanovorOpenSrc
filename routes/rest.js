@@ -5,13 +5,20 @@ const { v4: uuidv4 } = require('uuid');
 const state = require('../state');
 const user = require('../user');
 const utils = require('../lib/utils');
-const { users, sessions } = state;
+const { users, sessions, getNextAccountId, getNextEmAssetId } = state;
 const { findSessionByToken, createUserProfile, saveUserData, loadUserDataByUsername, loadUserData } = user;
-const { generateToken, generateAccountId, formatDateForNanovor } = utils;
+const { generateToken, formatDateForNanovor } = utils;
+
+function parseAccountId(param) {
+    const id = parseInt(param, 10);
+    return Number.isNaN(id) ? null : id;
+}
+
 function registerRest(app) {
 // Bank Frontend Service
 app.get('/bankfe/resources/account/:accountId', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account info request for ${accountId}, auth: ${auth}`);
@@ -94,7 +101,8 @@ app.get('/bankfe/resources/account/:accountId/stat', (req, res) => {
 
 // Additional account statistics endpoint by account ID (might be used by client)
 app.get('/bankfe/resources/account/:accountId/stat', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account stats request for ${accountId}, auth: ${auth}`);
@@ -178,7 +186,8 @@ app.get('/xsd/account-statistics/account-statistics.xsd', (req, res) => {
 // Endpoint for account statistics (used by requestFromBank with path "/stat/account/{accountId}")
 // The client requests this as: {bankURLRead}/stat/account/{accountId}?auth={token}
 app.get('/stat/account/:accountId', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account statistics request for ${accountId}, auth: ${auth}`);
@@ -269,7 +278,8 @@ app.get('/stat/account/', (req, res) => {
 
 // More specific catch-all for account-related requests to avoid interfering with asset requests
 app.get('/bankfe/resources/account/:accountId', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account info request for ${accountId}, auth: ${auth}`);
@@ -313,7 +323,8 @@ app.get('/bankfe/resources/account/:accountId', (req, res) => {
 
 // Additional endpoint that might be needed for user profile data
 app.get('/bankfe/resources/account/profile/:accountId', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account profile request for ${accountId}, auth: ${auth}`);
@@ -348,7 +359,8 @@ app.get('/bankfe/resources/account/profile/:accountId', (req, res) => {
 
 // Endpoint to add a nanovor to a user's inventory
 app.post('/bankfe/resources/account/:accountId/nanovor', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Add nanovor request for account ${accountId}, auth: ${auth}`);
@@ -435,7 +447,8 @@ app.post('/bankfe/resources/account/:accountId/nanovor', (req, res) => {
 
 // Endpoint to remove a nanovor from a user's inventory
 app.delete('/bankfe/resources/account/:accountId/nanovor/:nanovorId', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const nanovorId = parseInt(req.params.nanovorId);
     const auth = req.query.auth;
 
@@ -477,7 +490,8 @@ app.delete('/bankfe/resources/account/:accountId/nanovor/:nanovorId', (req, res)
 
 // Endpoint to add an Energy Matrix to a user's inventory
 app.post('/bankfe/resources/account/:accountId/em', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Add EM request for account ${accountId}, auth: ${auth}`);
@@ -512,9 +526,9 @@ app.post('/bankfe/resources/account/:accountId/em', (req, res) => {
             if (em && em[0]) {
                 const e = em[0];
                 emData = {
-                    id: parseInt(e.id?.[0]) || 0,
+                    id: parseInt(e.id?.[0], 10) || 0,
                     name: e.name?.[0] || 'Unknown EM',
-                    assetTypeId: parseInt(e.assetTypeId?.[0]) || parseInt(e.id?.[0]) || 0
+                    assetTypeId: parseInt(e.assetTypeId?.[0], 10) || parseInt(e.id?.[0], 10) || 0
                 };
             } else {
                 return res.status(400).send('<error>No valid EM data found in XML</error>');
@@ -524,6 +538,15 @@ app.post('/bankfe/resources/account/:accountId/em', (req, res) => {
             return res.status(400).send('<error>Invalid XML data</error>');
         }
     }
+
+    // EM ids are integers only (no uuid). Assign next id if missing/0/non-integer.
+    const parsedId = typeof emData.id === 'number' ? Math.floor(emData.id) : parseInt(emData.id, 10);
+    if (Number.isNaN(parsedId) || parsedId < 1) {
+        emData.id = getNextEmAssetId();
+    } else {
+        emData.id = parsedId;
+    }
+    emData.assetTypeId = typeof emData.assetTypeId === 'number' ? Math.floor(emData.assetTypeId) : (parseInt(emData.assetTypeId, 10) || 0);
 
     // Add EM to user's inventory
     const user = users[accountId];
@@ -555,7 +578,8 @@ app.post('/bankfe/resources/account/:accountId/em', (req, res) => {
 
 // Endpoint to remove an Energy Matrix from a user's inventory
 app.delete('/bankfe/resources/account/:accountId/em/:emId', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const emId = parseInt(req.params.emId);
     const auth = req.query.auth;
 
@@ -598,7 +622,8 @@ app.use('/xsd', express.static(path.join(__dirname, '..', 'xsd')));
 
 // Account badges endpoint
 app.get('/bankfe/resources/account/:accountId/badge', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account badges request for ${accountId}, auth: ${auth}`);
@@ -632,7 +657,8 @@ app.get('/bankfe/resources/account/:accountId/badge', (req, res) => {
 
 // Asset list endpoint - this is what the VirmonManager uses to get collection data
 app.get('/bankfe/resources/account/:accountId/asset-list', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Asset list request received for ${accountId}, auth: ${auth}`);
@@ -664,98 +690,59 @@ app.get('/bankfe/resources/account/:accountId/asset-list', (req, res) => {
 
     // Add nanovor to the asset list (only include nanovor for now, excluding EMs)
     const nanovorList = user.nanovorInventory || [];
-    for (const nanovor of nanovorList) {
-        // Format as asset with the exact structure expected by the client
-        const assetId = `${nanovor.assetId || nanovor.id}`; // Use the assetId if available, otherwise use id
+    for (let i = 0; i < nanovorList.length; i++) {
+        const nanovor = nanovorList[i];
+        const assetId = Number(nanovor.id);
 
-        // Use stored data if available, otherwise use defaults
         const productionNumber = nanovor.productionNumber || 1;
         const birthDate = nanovor.birthDate || formatDateForNanovor(new Date());
         const lastEvolutionDate = nanovor.lastEvolutionDate || formatDateForNanovor(new Date());
+        // virmon-master asset-type ID
+        const assetTypeId = nanovor.assetTypeId ?? 1;
+        const assetTypeName = nanovor.name || 'Unknown Nanovor';
 
         assetsXml += `
-    <asset id="1" xmlns:ns2="http://smithandtinker.com/xsd/asset-miscellany" xmlns:ns3="http://smithandtinker.com/xsd/asset-stat">
-    <asset-type-category>virmon</asset-type-category>
-    <asset-type-id>1</asset-type-id>
-    <asset-type-name>Electropod 1.0</asset-type-name>
-    <production-number>1</production-number>
-    <birth-date>2024-01-01T00:00:00.000+00:00</birth-date>
-    <last-evolution-date>2024-01-01T00:00:00.000+00:00</last-evolution-date>
-    <ns2:asset-miscellany>
-      <ns2:nickname></ns2:nickname>
-    </ns2:asset-miscellany>
-    <ns3:asset-stat>
-      <ns3:asset-type-id>1</ns3:asset-type-id>
-      <ns3:speed>10</ns3:speed>
-      <ns3:strength>120</ns3:strength>
-      <ns3:armor>5</ns3:armor>
-      <ns3:health>100</ns3:health>
-      <ns3:kill-count>0</ns3:kill-count>
-      <ns3:kill-count-lifetime>0</ns3:kill-count-lifetime>
-      <ns3:battle-count>0</ns3:battle-count>
-      <ns3:battle-count-lifetime>0</ns3:battle-count-lifetime>
-      <ns3:death-count>0</ns3:death-count>
-      <ns3:death-count-lifetime>0</ns3:death-count-lifetime>
-      <ns3:magnamod-kill-count>0</ns3:magnamod-kill-count>
-      <ns3:magnamod-kill-count-lifetime>0</ns3:magnamod-kill-count-lifetime>
-      <ns3:hexite-kill-count>0</ns3:hexite-kill-count>
-      <ns3:hexite-kill-count-lifetime>0</ns3:hexite-kill-count-lifetime>
-      <ns3:velocitron-kill-count>0</ns3:velocitron-kill-count>
-      <ns3:velocitron-kill-count-lifetime>0</ns3:velocitron-kill-count-lifetime>
-      <ns3:win-count>0</ns3:win-count>
-      <ns3:win-count-lifetime>0</ns3:win-count-lifetime>
-      <ns3:critical-hit-count>0</ns3:critical-hit-count>
-      <ns3:whiff-count>0</ns3:whiff-count>
-      <ns3:screen-star>false</ns3:screen-star>
-      <ns3:scraped-by>false</ns3:scraped-by>
-      <ns3:all-attacks-used>false</ns3:all-attacks-used>
-      <ns3:slacker>false</ns3:slacker>
-      <ns3:max-damage-game>0</ns3:max-damage-game>
-      <ns3:max-damage-hit>0</ns3:max-damage-hit>
-      <ns3:max-round-count>0</ns3:max-round-count>
-    </ns3:asset-stat>
-  </asset>
-  <asset id="2" xmlns:ns2="http://smithandtinker.com/xsd/asset-miscellany" xmlns:ns3="http://smithandtinker.com/xsd/asset-stat">
-    <asset-type-category>virmon</asset-type-category>
-    <asset-type-id>24</asset-type-id>
-    <asset-type-name>Doom Blade 1.0</asset-type-name>
-    <production-number>1</production-number>
-    <birth-date>2024-01-01T00:00:00.000+00:00</birth-date>
-    <last-evolution-date>2024-01-01T00:00:00.000+00:00</last-evolution-date>
-    <ns2:asset-miscellany>
-      <ns2:nickname></ns2:nickname>
-    </ns2:asset-miscellany>
-    <ns3:asset-stat>
-      <ns3:asset-type-id>24</ns3:asset-type-id>
-      <ns3:speed>25</ns3:speed>
-      <ns3:strength>85</ns3:strength>
-      <ns3:armor>0</ns3:armor>
-      <ns3:health>100</ns3:health>
-      <ns3:kill-count>0</ns3:kill-count>
-      <ns3:kill-count-lifetime>0</ns3:kill-count-lifetime>
-      <ns3:battle-count>0</ns3:battle-count>
-      <ns3:battle-count-lifetime>0</ns3:battle-count-lifetime>
-      <ns3:death-count>0</ns3:death-count>
-      <ns3:death-count-lifetime>0</ns3:death-count-lifetime>
-      <ns3:magnamod-kill-count>0</ns3:magnamod-kill-count>
-      <ns3:magnamod-kill-count-lifetime>0</ns3:magnamod-kill-count-lifetime>
-      <ns3:hexite-kill-count>0</ns3:hexite-kill-count>
-      <ns3:hexite-kill-count-lifetime>0</ns3:hexite-kill-count-lifetime>
-      <ns3:velocitron-kill-count>0</ns3:velocitron-kill-count>
-      <ns3:velocitron-kill-count-lifetime>0</ns3:velocitron-kill-count-lifetime>
-      <ns3:win-count>0</ns3:win-count>
-      <ns3:win-count-lifetime>0</ns3:win-count-lifetime>
-      <ns3:critical-hit-count>0</ns3:critical-hit-count>
-      <ns3:whiff-count>0</ns3:whiff-count>
-      <ns3:screen-star>false</ns3:screen-star>
-      <ns3:scraped-by>false</ns3:scraped-by>
-      <ns3:all-attacks-used>false</ns3:all-attacks-used>
-      <ns3:slacker>false</ns3:slacker>
-      <ns3:max-damage-game>0</ns3:max-damage-game>
-      <ns3:max-damage-hit>0</ns3:max-damage-hit>
-      <ns3:max-round-count>0</ns3:max-round-count>
-    </ns3:asset-stat>
-  </asset>`;
+    <asset id="${assetId}" xmlns:ns2="http://smithandtinker.com/xsd/asset-miscellany" xmlns:ns3="http://smithandtinker.com/xsd/asset-stat">
+      <asset-type-category>virmon</asset-type-category>
+      <asset-type-id>${assetTypeId}</asset-type-id>
+      <asset-type-name>${assetTypeName}</asset-type-name>
+      <production-number>${productionNumber}</production-number>
+      <birth-date>${birthDate}</birth-date>
+      <last-evolution-date>${lastEvolutionDate}</last-evolution-date>
+      <ns2:asset-miscellany>
+        <ns2:nickname>${nanovor.nickname || ''}</ns2:nickname>
+      </ns2:asset-miscellany>
+      <ns3:asset-stat>
+        <ns3:asset-type-id>${assetTypeId}</ns3:asset-type-id>
+        <ns3:speed>${nanovor.speed || 10}</ns3:speed>
+        <ns3:strength>${nanovor.strength || 100}</ns3:strength>
+        <ns3:armor>${nanovor.armor || 5}</ns3:armor>
+        <ns3:health>${nanovor.health || 100}</ns3:health>
+        <ns3:kill-count>${nanovor.killCount || 0}</ns3:kill-count>
+        <ns3:kill-count-lifetime>${nanovor.lifetimeKillCount || 0}</ns3:kill-count-lifetime>
+        <ns3:battle-count>${nanovor.battleCount || 0}</ns3:battle-count>
+        <ns3:battle-count-lifetime>${nanovor.lifetimeBattleCount || 0}</ns3:battle-count-lifetime>
+        <ns3:death-count>${nanovor.deathCount || 0}</ns3:death-count>
+        <ns3:death-count-lifetime>${nanovor.lifetimeDeathCount || 0}</ns3:death-count-lifetime>
+        <ns3:magnamod-kill-count>${nanovor.magnamodKillCount || 0}</ns3:magnamod-kill-count>
+        <ns3:magnamod-kill-count-lifetime>${nanovor.magnamodLifetimeKillCount || 0}</ns3:magnamod-kill-count-lifetime>
+        <ns3:hexite-kill-count>${nanovor.hexiteKillCount || 0}</ns3:hexite-kill-count>
+        <ns3:hexite-kill-count-lifetime>${nanovor.hexiteLifetimeKillCount || 0}</ns3:hexite-kill-count-lifetime>
+        <ns3:velocitron-kill-count>${nanovor.velocitronKillCount || 0}</ns3:velocitron-kill-count>
+        <ns3:velocitron-kill-count-lifetime>${nanovor.velocitronLifetimeKillCount || 0}</ns3:velocitron-kill-count-lifetime>
+        <ns3:win-count>${nanovor.winCount || 0}</ns3:win-count>
+        <ns3:win-count-lifetime>${nanovor.lifetimeWinCount || 0}</ns3:win-count-lifetime>
+        <ns3:critical-hit-count>${nanovor.criticalHitCount || 0}</ns3:critical-hit-count>
+        <ns3:whiff-count>${nanovor.whiffCount || 0}</ns3:whiff-count>
+        <ns3:screen-star>${nanovor.isScreenStar || false}</ns3:screen-star>
+        <ns3:scraped-by>${nanovor.isScrapedBy || false}</ns3:scraped-by>
+        <ns3:all-attacks-used>${nanovor.areAllAttacksUsed || false}</ns3:all-attacks-used>
+        <ns3:slacker>${nanovor.isSlacker || false}</ns3:slacker>
+        <ns3:max-damage-game>${nanovor.maxDamageGame || 0}</ns3:max-damage-game>
+        <ns3:max-damage-hit>${nanovor.maxDamageHit || 0}</ns3:max-damage-hit>
+        <ns3:max-round-count>${nanovor.maxRoundCount || 0}</ns3:max-round-count>
+      </ns3:asset-stat>
+    </asset>`;
     }
 
     // NOTE: EM assets are intentionally excluded for now to simplify the asset list
@@ -808,7 +795,8 @@ app.post('/bankfe/resources/account/refresh-login', (req, res) => {
 
 // Additional endpoints that might be needed for inventory/collections after login
 app.get('/bankfe/resources/account/collections/:accountId', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account collections request for ${accountId}, auth: ${auth}`);
@@ -900,7 +888,8 @@ app.get('/bankfe/resources/asset/:assetId/badge', (req, res) => {
 
 // Endpoint for saving/updating user profile information
 app.post('/bankfe/resources/account/:accountId/profile', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account profile update request for ${accountId}, auth: ${auth}`);
@@ -965,7 +954,8 @@ app.post('/bankfe/resources/asset/:assetId/jolt', (req, res) => {
 
 // Account activity endpoint for determining new user status
 app.get('/bankfe/resources/account/activity/:accountId', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account activity request for ${accountId}, auth: ${auth}`);
@@ -1055,7 +1045,8 @@ app.post('/bankfe/resources/evolution/:evolutionId', (req, res) => {
 
 // Device management endpoint
 app.get('/bankfe/resources/account/:accountId/device', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Device management request for account ${accountId}, auth: ${auth}`);
@@ -1087,7 +1078,8 @@ app.get('/bankfe/resources/account/:accountId/device', (req, res) => {
 
 // Account asset endpoint - returns user's assets/collections
 app.get('/bankfe/resources/account/:accountId/asset', (req, res) => {
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Account asset request for ${accountId}, auth: ${auth}`);
@@ -1113,21 +1105,20 @@ app.get('/bankfe/resources/account/:accountId/asset', (req, res) => {
     // Use the existing inventory from user.nanovorInventory, don't override it
     const nanovorList = user.nanovorInventory || [];
 
-    // Build XML for nanovor inventory in the exact format expected by VirmonData.parseXMLData
+    // Build XML for nanovor inventory. (VirmonData.parseXMLData)
     let assetsXml = '';
-    for (const nanovor of nanovorList) {
-        // Format as asset with the exact structure expected by the client
-        // The asset-id should be a unique instance identifier
-        const assetId = `${nanovor.assetId || nanovor.id}`; // Use the assetId if available, otherwise use id
+    for (let i = 0; i < nanovorList.length; i++) {
+        const nanovor = nanovorList[i];
+        const assetId = Number(nanovor.id); // DB id (integer), stable id for this nanovor
 
-        // Use stored data if available, otherwise use defaults
         const productionNumber = nanovor.productionNumber || 1;
         const birthDate = nanovor.birthDate || formatDateForNanovor(new Date());
         const lastEvolutionDate = nanovor.lastEvolutionDate || formatDateForNanovor(new Date());
 
         assetsXml += `
-    <asset id="${assetId}" xmlns:ns2="http://127.0.0.1:8443/xsd/asset-miscellany/asset-miscellany.xsd" xmlns:ns3="http://127.0.0.1:8443/xsd/asset-stat/asset-stat.xsd">
-      <asset-type-id>${nanovor.assetTypeId || nanovor.id}</asset-type-id>
+    <asset id="${assetId}" xmlns:ns2="http://smithandtinker.com/xsd/asset-miscellany" xmlns:ns3="http://smithandtinker.com/xsd/asset-stat">
+      <asset-type-category>virmon</asset-type-category>
+      <asset-type-id>${nanovor.assetTypeId ?? 1}</asset-type-id>
       <asset-type-name>${nanovor.name || 'Unknown Nanovor'}</asset-type-name>
       <production-number>${productionNumber}</production-number>
       <birth-date>${birthDate}</birth-date>
@@ -1136,6 +1127,7 @@ app.get('/bankfe/resources/account/:accountId/asset', (req, res) => {
         <ns2:nickname>${nanovor.nickname || ''}</ns2:nickname>
       </ns2:asset-miscellany>
       <ns3:asset-stat>
+        <ns3:asset-type-id>${nanovor.assetTypeId ?? 1}</ns3:asset-type-id>
         <ns3:speed>${nanovor.speed || 10}</ns3:speed>
         <ns3:strength>${nanovor.strength || 100}</ns3:strength>
         <ns3:armor>${nanovor.armor || 5}</ns3:armor>
@@ -1367,7 +1359,8 @@ app.get('/device/:deviceId/asset/:assetId/sign/vinfo', (req, res) => {
 // Device player info endpoint
 app.get('/device/:deviceId/account/:accountId/sign/plyinfo', (req, res) => {
     const deviceId = req.params.deviceId;
-    const accountId = req.params.accountId;
+    const accountId = parseAccountId(req.params.accountId);
+    if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Device player info request for device ${deviceId}, account ${accountId}, auth: ${auth}`);
@@ -1677,6 +1670,17 @@ app.get('/bankfe/manifests/*', (req, res) => {
     res.send(emptyManifest);
 });
 
+// Sensei/tutorial players (Training, Easy, Medium) - client expects this for battle player IDs
+app.get('/Assets/Client/sensei-players.xml', (req, res) => {
+    const senseiPath = path.join(__dirname, 'Manifests', 'Client', 'sensei-players.xml');
+    if (fs.existsSync(senseiPath)) {
+        res.set('Content-Type', 'application/xml; charset=utf-8');
+        res.send(fs.readFileSync(senseiPath, 'utf8'));
+    } else {
+        res.status(404).send('Asset not found');
+    }
+});
+
 // Additional asset endpoints that might be requested
 app.get('/Assets/Client/*', (req, res) => {
     console.log(`[${new Date().toISOString()}] Client asset request: ${req.path}, Query:`, req.query, 'Headers:', req.headers);
@@ -1973,22 +1977,16 @@ app.get('/test-login/:username', (req, res) => {
     const username = req.params.username;
     console.log(`Test login request for user: ${username}`);
 
-    // Generate a login token
     const loginToken = generateToken();
-    const accountId = generateAccountId(username);
-
-    // First, try to load existing user data from file
-    const existingUser = loadUserDataByUsername(username);
-    if (!existingUser) {
-        // User doesn't exist in file, create a new profile
-        if (!users[accountId]) {
-            users[accountId] = createUserProfile(accountId, username);
-
-            // Save the new user data to file
-            saveUserData(accountId);
-        }
+    let existingUser = loadUserDataByUsername(username);
+    let accountId;
+    if (existingUser) {
+        accountId = existingUser.id;
+    } else {
+        accountId = getNextAccountId();
+        users[accountId] = createUserProfile(accountId, username);
+        saveUserData(accountId);
     }
-    // If existingUser exists, it's already loaded into the users object by loadUserDataByUsername
 
     // Create session
     const sessionId = uuidv4();

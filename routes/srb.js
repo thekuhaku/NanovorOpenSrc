@@ -8,10 +8,10 @@ const user = require('../user');
 const srb = require('../lib/srb');
 const utils = require('../lib/utils');
 
-const { users, sessions } = state;
+const { users, getNextAccountId } = state;
 const { extractParamsFromRequest, createSrbResponse } = srb;
-const { generateToken, generateAccountId } = utils;
-const { findSessionByToken, createUserProfile, saveUserData, loadUserDataByUsername } = user;
+const { generateToken } = utils;
+const { createUserProfile, saveUserData, loadUserDataByUsername } = user;
 
 function registerSrb(app) {
     app.post('/xmlrpc', (req, res) => {
@@ -52,37 +52,33 @@ function registerSrb(app) {
             const loginToken = generateToken();
             const username = params.playername || 'n';
             console.log(`[${new Date().toISOString()}] Using username: '${username}' (from params: '${params.playername}')`);
-            const accountId = generateAccountId(username);
 
-            const existingUser = loadUserDataByUsername(username);
-            console.log(`[${new Date().toISOString()}] Existing user lookup for ${username}: ${existingUser ? 'found' : 'not found'}`);
-            if (!existingUser) {
-                if (!users[accountId]) {
-                    users[accountId] = createUserProfile(accountId, username);
-                    console.log(`[${new Date().toISOString()}] Created new user profile for ${username} (ID: ${accountId})`);
-                    console.log(`[${new Date().toISOString()}] New user nanovor inventory:`, users[accountId].nanovorInventory);
-                    console.log(`[${new Date().toISOString()}] Full new user profile nanovor inventory:`, JSON.stringify(users[accountId].nanovorInventory, null, 2));
-                    saveUserData(accountId);
-                }
+            let existingUser = loadUserDataByUsername(username);
+            let accountId;
+            if (existingUser) {
+                accountId = existingUser.id;
+                console.log(`[${new Date().toISOString()}] Existing user ${username} (accountId: ${accountId})`);
             } else {
-                console.log(`[${new Date().toISOString()}] Loaded existing user profile for ${username} (ID: ${accountId})`);
-                console.log(`[${new Date().toISOString()}] Existing user nanovor inventory:`, existingUser.nanovorInventory);
+                accountId = getNextAccountId();
+                users[accountId] = createUserProfile(accountId, username);
+                saveUserData(accountId);
+                console.log(`[${new Date().toISOString()}] Created new user ${username} (accountId: ${accountId})`);
             }
 
             const sessionId = uuidv4();
-            sessions[sessionId] = {
-                accountId: accountId,
-                loginToken: loginToken,
+            state.sessions[sessionId] = {
+                accountId,
+                loginToken,
                 expires: Date.now() + 30 * 60 * 1000,
                 ip: req.ip
             };
 
-            console.log(`[${new Date().toISOString()}] Created session for user ${username} (ID: ${accountId}), session ID: ${sessionId}`);
+            console.log(`[${new Date().toISOString()}] Created session for user ${username} (accountId: ${accountId}), session ID: ${sessionId}`);
 
             const srbResponse = createSrbResponse(accountId, loginToken);
             res.set('Content-Type', 'application/xml; charset=utf-8');
             res.send(srbResponse);
-            console.log(`[${new Date().toISOString()}] SRB Response sent successfully for user ${username} (ID: ${accountId})`);
+            console.log(`[${new Date().toISOString()}] SRB Response sent successfully for user ${username} (accountId: ${accountId})`);
         } else {
             console.log(`[${new Date().toISOString()}] Unsupported SRB method:`, requestBody);
             res.status(400).send('Unsupported method');

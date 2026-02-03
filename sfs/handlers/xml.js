@@ -96,6 +96,7 @@ function handleXmlMessage(socket, message) {
                     socket.loggedIn = true;
                     socket.userId = session.accountId;
                     socket.userName = username;
+                    socket.playerId = session.accountId;
 
                     // Register socket in the global socket map
                     socketMap[session.accountId] = socket;
@@ -133,13 +134,11 @@ function handleXmlMessage(socket, message) {
                         saveUserData(session.accountId);
                     }
 
-                    // Send system login response first (this follows the expected SFS protocol)
-                    const sysLoginResponse = `<msg t="sys"><body action="logOK" r="0"><login id="${session.accountId}" mod="0" n="${username}"/></body></msg>\x00`;
+                    const sysLoginResponse = `<msg t="sys"><body action="logOK" r="0"><login id="${socket.playerId}" mod="0" n="${username}"/></body></msg>\x00`;
                     console.log('Sending system login response:', sysLoginResponse.replace(/\x00/g, '\\x00'));
                     socket.write(sysLoginResponse);
 
                     // Add a small delay before sending the extension response to ensure proper sequencing.
-                    // logOK sends only _cmd, chatRoomName, username.
                     setTimeout(() => {
                         const loginOkResponse = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"logOK","chatRoomName":"Lobby","username":"${socket.userName}"}]]></body></msg>\x00`;
                         console.log('Sending extension login response:', loginOkResponse.replace(/\x00/g, '\\x00'));

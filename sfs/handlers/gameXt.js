@@ -5,7 +5,66 @@ const { users, battleRooms } = state;
 const { sendMessageToUser, broadcastToBattle } = battle;
 const { saveUserData } = user;
 
+/** Sensei (AI) player IDs from sensei-players.xml. */
+const SENSEI_IDS = new Set(['-5', '-4', '-3', '-2', '-1', -5, -4, -3, -2, -1]);
+
+/** Client-facing userRefId string. Sensei battles: client uses _userProfile.id=0 for human, so send "0"; sensei keeps their id. */
+function clientUserRefId(battleRoom, p) {
+    if (!p) return '';
+    if (isSenseiBattle(battleRoom) && !SENSEI_IDS.has(p.id)) return '0';
+    return String(p.id);
+}
+
+/** Build player list for client. Players have username, userRefId; we add selectedSwarmIds.
+ *  Order: player (positive id) first, then sensei (-5 etc.) so client sees players[0] = local, players[1] = Training. */
+function playersForClient(battleRoom) {
+    if (!battleRoom || !battleRoom.players) return [];
+    const hasSensei = battleRoom.players.some(p => SENSEI_IDS.has(p.id));
+    const list = battleRoom.players.map(p => ({
+        username: p.name,
+        userRefId: clientUserRefId(battleRoom, p),
+        selectedSwarmIds: Array.isArray(p.nanovorSwarm) ? p.nanovorSwarm : []
+    }));
+    if (hasSensei && list.length === 2) {
+        list.sort((a, b) => Number(b.userRefId) - Number(a.userRefId));
+    }
+    return list;
+}
+
+/** Default sensei swarms by userRefId (from sensei-players.xml). */
+const SENSEI_DEFAULT_SWARMS = {
+    '-5': [24],   // Training: Doom Blade
+    '-4': [3, 35, 50, 39],   // Medium
+    '-3': [11, 24, 6],       // Easy
+    '-2': [30, 44],          // " Easy "
+    '-1': [19, 39]           // "  Easy  "
+};
+
+/** True if this battle has a sensei (AI) player. Server sends isSenseiBattle so client can set SENSEI_BATTLE and show tutorial UI. */
+function isSenseiBattle(battleRoom) {
+    return battleRoom && battleRoom.players && battleRoom.players.some(p => SENSEI_IDS.has(p.id));
+}
+
+/** Ensure human player has a default swarm from inventory if empty (e.g. tutorial before setSwarm). Sensei gets default from SENSEI_DEFAULT_SWARMS. */
+function ensureDefaultSwarmForPlayer(battleRoom, playerIndex) {
+    if (!battleRoom || !battleRoom.players || playerIndex < 0 || playerIndex >= battleRoom.players.length) return;
+    const p = battleRoom.players[playerIndex];
+    if (p.nanovorSwarm && p.nanovorSwarm.length > 0) return;
+    const senseiId = String(p.id);
+    if (SENSEI_DEFAULT_SWARMS[senseiId]) {
+        p.nanovorSwarm = SENSEI_DEFAULT_SWARMS[senseiId].slice(0);
+        console.log(`[GAMEXT_LOG] Sensei default swarm for ${p.name} (${p.id}): [${p.nanovorSwarm.join(',')}]`);
+        return;
+    }
+    const u = users[p.id];
+    if (!u || !u.nanovorInventory || u.nanovorInventory.length === 0) return;
+    const limit = Math.min(2, u.nanovorInventory.length);
+    p.nanovorSwarm = u.nanovorInventory.slice(0, limit).map(n => Number(n.id)).filter(n => !Number.isNaN(n));
+    console.log(`[GAMEXT_LOG] Default swarm for ${p.name} (${p.id}): [${p.nanovorSwarm.join(',')}]`);
+}
+
 function handleGameXtCommand(socket, command, params) {
+    if (socket.playerId == null && socket.userId != null) socket.playerId = socket.userId;
     console.log(`[GAMEXT_LOG] Handling gameXt command: ${command}`, params);
 
     let response = '';
@@ -27,14 +86,14 @@ function handleGameXtCommand(socket, command, params) {
                 gameSwarmValue: gameSwarmValue,
                 maxPlayers: totalPlayers,
                 players: [{
-                    id: socket.userId,
+                    id: socket.playerId,
                     name: socket.userName,
                     ready: false,
                     nanovorSwarm: [],
                     selectedNanovor: null,
                     enemyTarget: null
                 }],
-                creator: socket.userId,
+                creator: socket.playerId,
                 creatorName: socket.userName,
                 gameState: 'waiting_for_players', // waiting_for_players, in_progress, finished
                 turnOrder: [],
@@ -67,14 +126,14 @@ function handleGameXtCommand(socket, command, params) {
                 gameSwarmValue: customSwarmValue,
                 maxPlayers: 2, // Default to 2 players
                 players: [{
-                    id: socket.userId,
+                    id: socket.playerId,
                     name: socket.userName,
                     ready: false,
                     nanovorSwarm: [],
                     selectedNanovor: null,
                     enemyTarget: null
                 }],
-                creator: socket.userId,
+                creator: socket.playerId,
                 creatorName: socket.userName,
                 gameState: 'waiting_for_players',
                 turnOrder: [],
@@ -108,7 +167,7 @@ function handleGameXtCommand(socket, command, params) {
 
             if (inviteeId) {
                 // Send invitation to the invitee
-                const invitationMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationRequest","battleName":"${battleToInvite}","inviter":{"username":"${socket.userName}","userRefId":"${socket.userId}"},"gameSwarmValue":${battleRooms[battleToInvite]?.gameSwarmValue || 1000},"convertedChatRoom":${convertedRoom}}]]></body></msg>\x00`;
+                const invitationMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationRequest","battleName":"${battleToInvite}","inviter":{"username":"${socket.userName}","userRefId":"${socket.playerId}"},"gameSwarmValue":${battleRooms[battleToInvite]?.gameSwarmValue || 1000},"convertedChatRoom":${convertedRoom}}]]></body></msg>\x00`;
 
                 if (sendMessageToUser(inviteeId, invitationMsg)) {
                     response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationSent","battleName":"${battleToInvite}","invitedUser":"${invitee}"}]]></body></msg>\x00`;
@@ -134,7 +193,7 @@ function handleGameXtCommand(socket, command, params) {
                     // Add the user to the battle room if there's space
                     if (battleRoom.players.length < battleRoom.maxPlayers) {
                         battleRoom.players.push({
-                            id: socket.userId,
+                            id: socket.playerId,
                             name: socket.userName,
                             ready: false,
                             nanovorSwarm: [],
@@ -146,7 +205,7 @@ function handleGameXtCommand(socket, command, params) {
                         socket.activeBattle = battleName;
 
                         // Send invitation response to the game creator
-                        const responseMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationResponse","battleName":"${battleName}","player":"${socket.userName}","inviterName":"${battleRoom.creatorName}","inviterId":"${battleRoom.creator}","otherPlayers":${JSON.stringify(battleRoom.players.filter(p => p.id !== socket.userId && p.id !== battleRoom.creator).map(p => ({username: p.name, userRefId: p.id})))}}]]></body></msg>\x00`;
+                        const responseMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationResponse","battleName":"${battleName}","player":"${socket.userName}","inviterName":"${battleRoom.creatorName}","inviterId":"${battleRoom.creator}","otherPlayers":${JSON.stringify(battleRoom.players.filter(p => p.id !== socket.playerId && p.id !== battleRoom.creator).map(p => ({username: p.name, userRefId: p.id})))}}]]></body></msg>\x00`;
 
                         sendMessageToUser(battleRoom.creator, responseMsg);
 
@@ -154,11 +213,12 @@ function handleGameXtCommand(socket, command, params) {
                         if (battleRoom.players.length === battleRoom.maxPlayers) {
                             battleRoom.gameState = 'in_progress';
 
-                            // Set up turn order
+                            // Set up turn order and ensure default swarm for humans
                             battleRoom.turnOrder = [...battleRoom.players];
+                            battleRoom.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(battleRoom, idx); });
 
-                            // Send game started message to all players
-                            const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${battleName}","players":${JSON.stringify(battleRoom.players.map(p => ({username: p.name, userRefId: p.id})))},"gameCreator":"${battleRoom.creatorName}"}]]></body></msg>\x00`;
+                            // Send game started message to all players (include selectedSwarmIds)
+                            const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${battleName}","players":${JSON.stringify(playersForClient(battleRoom))},"gameCreator":"${battleRoom.creatorName}"}]]></body></msg>\x00`;
 
                             broadcastToBattle(battleName, gameStartMsg);
                         }
@@ -189,13 +249,13 @@ function handleGameXtCommand(socket, command, params) {
             const newSwarmValue = params.gameSwarmValue || 1000;
             const currentBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
-            if (currentBattle && currentBattle.creator === socket.userId) {
+            if (currentBattle && currentBattle.creator === socket.playerId) {
                 currentBattle.gameSwarmValue = newSwarmValue;
 
                 // Notify other players of the change
                 const swarmValueSetMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameSwarmValueSet","battleName":"${currentBattle.name}","gameSwarmValue":${newSwarmValue}}]]></body></msg>\x00`;
 
-                broadcastToBattle(currentBattle.name, swarmValueSetMsg, socket.userId);
+                broadcastToBattle(currentBattle.name, swarmValueSetMsg, socket.playerId);
 
                 response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameSwarmValueSet","battleName":"${currentBattle.name}","gameSwarmValue":${newSwarmValue}}]]></body></msg>\x00`;
             } else {
@@ -205,19 +265,26 @@ function handleGameXtCommand(socket, command, params) {
 
         case 'setSwarm':
             console.log(`[GAMEXT_LOG] setSwarm command called by user ${socket.userId} (${socket.userName})`, params);
-            // Set the player's battle swarm with enhanced validation for NewUserState
-            const nanovorIds = params.nanovorIds ? params.nanovorIds.split(',').map(id => parseInt(id)) : [];
+            // Parse nanovor IDs: client may send nanovorIds, selectedSwarmIds, or swarmIds (string "1,24", array [1, 24], or array of objects [{id:1}])
+            const rawNanovorIds = params.nanovorIds ?? params.selectedSwarmIds ?? params.swarmIds;
+            let nanovorIds = [];
+            if (rawNanovorIds != null) {
+                if (Array.isArray(rawNanovorIds)) {
+                    nanovorIds = rawNanovorIds.map(item => (item && typeof item === 'object' && 'id' in item ? Number(item.id) : Number(item))).filter(n => !Number.isNaN(n));
+                } else {
+                    nanovorIds = String(rawNanovorIds).split(',').map(id => parseInt(id.trim(), 10)).filter(n => !Number.isNaN(n));
+                }
+            }
             const activeBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
             if (activeBattle) {
-                const playerIndex = activeBattle.players.findIndex(p => p.id === socket.userId);
+                const playerIndex = activeBattle.players.findIndex(p => p.id === socket.playerId);
                 if (playerIndex !== -1) {
-                    // Validate that the user actually owns these nanovor
+                    // Validate that the user actually owns these nanovor (match by numeric id)
                     const user = users[socket.userId];
-                    if (user && user.nanovorInventory) {
-                        // Check if all requested nanovor IDs are in the user's inventory
+                    if (user && user.nanovorInventory && user.nanovorInventory.length > 0) {
                         const validNanovorIds = nanovorIds.filter(nanovorId =>
-                            user.nanovorInventory.some(nano => nano.id === nanovorId)
+                            user.nanovorInventory.some(nano => Number(nano.id) === Number(nanovorId))
                         );
 
                         // Check if the swarm size is within limits
@@ -244,24 +311,24 @@ function handleGameXtCommand(socket, command, params) {
                             activeBattle.players[playerIndex].nanovorSwarm = validNanovorIds;
                             console.log(`[GAMEXT_LOG] setSwarm accepted - user ${socket.userId} set swarm with ${validNanovorIds.length} nanovors (value: ${totalSwarmValue})`);
 
-                            // Notify other players that this player has set their swarm
-                            const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${validNanovorIds.length},"swarmValue":${totalSwarmValue},"username":"${socket.userName}","userRefId":"${socket.userId}"}]]></body></msg>\x00`;
+                            const setSwarmUserRefId = clientUserRefId(activeBattle, activeBattle.players[playerIndex]);
+                            const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${validNanovorIds.length},"swarmValue":${totalSwarmValue},"username":"${socket.userName}","userRefId":"${setSwarmUserRefId}","selectedSwarmIds":${JSON.stringify(validNanovorIds)}}]]></body></msg>\x00`;
 
-                            broadcastToBattle(activeBattle.name, swarmSelectedMsg, socket.userId);
+                            broadcastToBattle(activeBattle.name, swarmSelectedMsg, socket.playerId);
 
-                            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${validNanovorIds.length},"swarmValue":${totalSwarmValue},"username":"${socket.userName}","userRefId":"${socket.userId}"}]]></body></msg>\x00`;
+                            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${validNanovorIds.length},"swarmValue":${totalSwarmValue},"username":"${socket.userName}","userRefId":"${setSwarmUserRefId}","selectedSwarmIds":${JSON.stringify(validNanovorIds)}}]]></body></msg>\x00`;
                         }
                     } else {
                         // User doesn't have inventory data, use basic validation
                         activeBattle.players[playerIndex].nanovorSwarm = nanovorIds;
                         console.log(`[GAMEXT_LOG] setSwarm accepted (no inventory validation) - user ${socket.userId} set swarm with ${nanovorIds.length} nanovors`);
 
-                        // Notify other players that this player has set their swarm
-                        const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${nanovorIds.length},"username":"${socket.userName}","userRefId":"${socket.userId}"}]]></body></msg>\x00`;
+                        const setSwarmUserRefId = clientUserRefId(activeBattle, activeBattle.players[playerIndex]);
+                        const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${nanovorIds.length},"username":"${socket.userName}","userRefId":"${setSwarmUserRefId}","selectedSwarmIds":${JSON.stringify(nanovorIds)}}]]></body></msg>\x00`;
 
-                        broadcastToBattle(activeBattle.name, swarmSelectedMsg, socket.userId);
+                        broadcastToBattle(activeBattle.name, swarmSelectedMsg, socket.playerId);
 
-                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${nanovorIds.length},"username":"${socket.userName}","userRefId":"${socket.userId}"}]]></body></msg>\x00`;
+                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${nanovorIds.length},"username":"${socket.userName}","userRefId":"${setSwarmUserRefId}","selectedSwarmIds":${JSON.stringify(nanovorIds)}}]]></body></msg>\x00`;
                     }
                 } else {
                     console.log(`[GAMEXT_LOG] setSwarm failed - user ${socket.userId} not found in battle ${socket.activeBattle}`);
@@ -279,7 +346,7 @@ function handleGameXtCommand(socket, command, params) {
             const selectedBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
             if (selectedBattle) {
-                const playerIndex = selectedBattle.players.findIndex(p => p.id === socket.userId);
+                const playerIndex = selectedBattle.players.findIndex(p => p.id === socket.playerId);
                 if (playerIndex !== -1) {
                     selectedBattle.players[playerIndex].selectedNanovor = selectedNanovorId;
 
@@ -298,7 +365,7 @@ function handleGameXtCommand(socket, command, params) {
             const enemyBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
             if (enemyBattle) {
-                const playerIndex = enemyBattle.players.findIndex(p => p.id === socket.userId);
+                const playerIndex = enemyBattle.players.findIndex(p => p.id === socket.playerId);
                 if (playerIndex !== -1) {
                     // Find the target player by username
                     const targetIndex = enemyBattle.players.findIndex(p => p.name === enemyUsername);
@@ -306,7 +373,7 @@ function handleGameXtCommand(socket, command, params) {
                         enemyBattle.players[playerIndex].enemyTarget = enemyBattle.players[targetIndex].id;
 
                         // Send target selected notification to all players
-                        const targetSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"targetSelected","userRefId":"${socket.userId}","targetUserRefId":"${enemyBattle.players[targetIndex].id}","attackId":0}]]></body></msg>\x00`;
+                        const targetSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"targetSelected","userRefId":"${socket.playerId}","targetUserRefId":"${enemyBattle.players[targetIndex].id}","attackId":0}]]></body></msg>\x00`;
 
                         broadcastToBattle(enemyBattle.name, targetSelectedMsg);
 
@@ -331,14 +398,14 @@ function handleGameXtCommand(socket, command, params) {
             const attackBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
             if (attackBattle) {
-                const playerIndex = attackBattle.players.findIndex(p => p.id === socket.userId);
+                const playerIndex = attackBattle.players.findIndex(p => p.id === socket.playerId);
                 if (playerIndex !== -1) {
                     // Find the target player
                     const targetIndex = attackBattle.players.findIndex(p => p.name === targetPlayerName);
                     if (targetIndex !== -1) {
                         // Record the attack info
                         const attackInfo = {
-                            attackerId: socket.userId,
+                            attackerId: socket.playerId,
                             targetId: attackBattle.players[targetIndex].id,
                             nanovorId: myNanovorId,
                             attackId: setAttackId,
@@ -349,7 +416,7 @@ function handleGameXtCommand(socket, command, params) {
                         attackBattle.battleHistory.push(attackInfo);
 
                         // Send attack performed notification to all players
-                        const attackMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"performAttack","attackResults":{"attackerId":"${socket.userId}","targetId":"${attackBattle.players[targetIndex].id}","nanovorId":${myNanovorId},"attackId":${setAttackId}}}]]></body></msg>\x00`;
+                        const attackMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"performAttack","attackResults":{"attackerId":"${socket.playerId}","targetId":"${attackBattle.players[targetIndex].id}","nanovorId":${myNanovorId},"attackId":${setAttackId}}}]]></body></msg>\x00`;
 
                         broadcastToBattle(attackBattle.name, attackMsg);
 
@@ -472,9 +539,10 @@ function handleGameXtCommand(socket, command, params) {
 
                 // Set up turn order
                 startBattle.turnOrder = [...startBattle.players];
+                startBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(startBattle, idx); });
 
-                // Send game started message to all players
-                const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startBattleName}","players":${JSON.stringify(startBattle.players.map(p => ({username: p.name, userRefId: p.id})))},"gameCreator":"${startBattle.creatorName}"}]]></body></msg>\x00`;
+                // Send game started message to all players (include selectedSwarmIds so client can show nanovors)
+                const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startBattleName}","players":${JSON.stringify(playersForClient(startBattle))},"gameCreator":"${startBattle.creatorName}"}]]></body></msg>\x00`;
 
                 broadcastToBattle(startBattleName, gameStartMsg);
 
@@ -501,7 +569,7 @@ function handleGameXtCommand(socket, command, params) {
             const swapBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
             if (swapBattle) {
-                const playerIndex = swapBattle.players.findIndex(p => p.id === socket.userId);
+                const playerIndex = swapBattle.players.findIndex(p => p.id === socket.playerId);
                 if (playerIndex !== -1) {
                     // Record the swap intention
                     swapBattle.players[playerIndex].nextSwap = nextNanovorId;
@@ -527,7 +595,7 @@ function handleGameXtCommand(socket, command, params) {
             const usernameToKick = params.username;
             const kickBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
-            if (kickBattle && kickBattle.creator === socket.userId) {
+            if (kickBattle && kickBattle.creator === socket.playerId) {
                 // Find and remove the player
                 const playerToKickIndex = kickBattle.players.findIndex(p => p.name === usernameToKick);
                 if (playerToKickIndex !== -1) {
@@ -571,7 +639,7 @@ function handleGameXtCommand(socket, command, params) {
             const readyBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
             if (readyBattle) {
-                const playerIndex = readyBattle.players.findIndex(p => p.id === socket.userId);
+                const playerIndex = readyBattle.players.findIndex(p => p.id === socket.playerId);
                 if (playerIndex !== -1) {
                     readyBattle.players[playerIndex].ready = true;
                     console.log(`[GAMEXT_LOG] setReady - user ${socket.userId} marked as ready in battle ${readyBattle.name}`);
@@ -584,16 +652,17 @@ function handleGameXtCommand(socket, command, params) {
                         readyBattle.gameState = 'in_progress';
                         console.log(`[GAMEXT_LOG] setReady - all players ready, starting game in battle ${readyBattle.name}`);
 
-                        // Set up turn order
+                        // Set up turn order and ensure human players have default swarm if empty
                         readyBattle.turnOrder = [...readyBattle.players];
+                        readyBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(readyBattle, idx); });
 
-                        // Send game started message to all players
-                        const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${readyBattle.name}","players":${JSON.stringify(readyBattle.players.map(p => ({username: p.name, userRefId: p.id})))},"gameCreator":"${readyBattle.creatorName}"}]]></body></msg>\x00`;
+                        // Send game started message to all players (include selectedSwarmIds)
+                        const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${readyBattle.name}","players":${JSON.stringify(playersForClient(readyBattle))},"gameCreator":"${readyBattle.creatorName}"}]]></body></msg>\x00`;
 
                         broadcastToBattle(readyBattle.name, gameStartMsg);
                     }
 
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerReady","userRefId":"${socket.userId}","ready":true}]]></body></msg>\x00`;
+                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerReady","userRefId":"${socket.playerId}","ready":true}]]></body></msg>\x00`;
                 } else {
                     console.log(`[GAMEXT_LOG] setReady failed - user ${socket.userId} not found in battle ${socket.activeBattle}`);
                     response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
@@ -610,10 +679,11 @@ function handleGameXtCommand(socket, command, params) {
 
             if (statusBattle) {
                 const playerStatus = statusBattle.players.map(p => ({
-                    userRefId: p.id,
+                    userRefId: clientUserRefId(statusBattle, p),
                     username: p.name,
                     ready: p.ready,
-                    nanovorSwarmSize: p.nanovorSwarm ? p.nanovorSwarm.length : 0
+                    nanovorSwarmSize: p.nanovorSwarm ? p.nanovorSwarm.length : 0,
+                    selectedSwarmIds: Array.isArray(p.nanovorSwarm) ? p.nanovorSwarm : []
                 }));
 
                 response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerStatusList","players":${JSON.stringify(playerStatus)}}]}</body></msg>\x00`;
@@ -644,7 +714,7 @@ function handleGameXtCommand(socket, command, params) {
             if (performAttackBattle) {
                 // Record the attack in battle history
                 const attackRecord = {
-                    attackerId: socket.userId,
+                    attackerId: socket.playerId,
                     targetId: targetUserRefId,
                     nanovorId: attackNanovorId,
                     attackId: attackId,
@@ -655,7 +725,7 @@ function handleGameXtCommand(socket, command, params) {
                 console.log(`[GAMEXT_LOG] performAttack recorded - ${socket.userId} attacked ${targetUserRefId} with nanovor ${attackNanovorId}, attackId: ${attackId}`);
 
                 // Send attack notification to all players
-                const attackMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"performAttack","attackResults":{"attackerId":"${socket.userId}","targetId":"${targetUserRefId}","nanovorId":${attackNanovorId},"attackId":${attackId}}}]]></body></msg>\x00`;
+                const attackMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"performAttack","attackResults":{"attackerId":"${socket.playerId}","targetId":"${targetUserRefId}","nanovorId":${attackNanovorId},"attackId":${attackId}}}]]></body></msg>\x00`;
 
                 broadcastToBattle(performAttackBattle.name, attackMsg);
 
@@ -673,13 +743,13 @@ function handleGameXtCommand(socket, command, params) {
             const swapNanovorBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
             if (swapNanovorBattle) {
-                const playerIndex = swapNanovorBattle.players.findIndex(p => p.id === socket.userId);
+                const playerIndex = swapNanovorBattle.players.findIndex(p => p.id === socket.playerId);
                 if (playerIndex !== -1) {
                     // Update the selected nanovor
                     swapNanovorBattle.players[playerIndex].selectedNanovor = newNanovorId;
 
                     // Notify all players about the swap
-                    const swapMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swapNanovor","userRefId":"${socket.userId}","newNanovorId":${newNanovorId}}]]></body></msg>\x00`;
+                    const swapMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swapNanovor","userRefId":"${socket.playerId}","newNanovorId":${newNanovorId}}]]></body></msg>\x00`;
 
                     broadcastToBattle(swapNanovorBattle.name, swapMsg);
 
@@ -733,12 +803,12 @@ function handleGameXtCommand(socket, command, params) {
             const selectBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
             if (selectBattle) {
-                const playerIndex = selectBattle.players.findIndex(p => p.id === socket.userId);
+                const playerIndex = selectBattle.players.findIndex(p => p.id === socket.playerId);
                 if (playerIndex !== -1) {
                     selectBattle.players[playerIndex].selectedNanovor = selectNanovorId;
 
                     // Notify all players about the selection
-                    const selectMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"selectNanovor","userRefId":"${socket.userId}","nanovorId":${selectNanovorId}}]]></body></msg>\x00`;
+                    const selectMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"selectNanovor","userRefId":"${socket.playerId}","nanovorId":${selectNanovorId}}]]></body></msg>\x00`;
 
                     broadcastToBattle(selectBattle.name, selectMsg);
 
@@ -752,7 +822,7 @@ function handleGameXtCommand(socket, command, params) {
             break;
 
         case 'setRoundInfo':
-            // Set round information
+            // Set round information. Client RoundInfo constructor expects param1.players (not param1.roundInfo.players).
             const roundInfo = params.roundInfo;
             const roundInfoBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
@@ -760,12 +830,13 @@ function handleGameXtCommand(socket, command, params) {
                 // Update round info in battle
                 roundInfoBattle.currentRoundInfo = roundInfo;
 
-                // Notify all players about the round info
-                const roundInfoMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"setRoundInfo","roundInfo":${JSON.stringify(roundInfo)}}]}</body></msg>\x00`;
+                // Client expects { _cmd, players, roundCounter } at top level so RoundInfo(param1) sees param1.players
+                const setRoundPayload = Object.assign({ _cmd: 'setRoundInfo' }, roundInfo);
+                const roundInfoMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[${JSON.stringify(setRoundPayload)}]]></body></msg>\x00`;
 
                 broadcastToBattle(roundInfoBattle.name, roundInfoMsg);
 
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"roundInfoSet","round":${roundInfoBattle.round}}]}</body></msg>\x00`;
+                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"roundInfoSet","round":${roundInfoBattle.round}}]]></body></msg>\x00`;
             } else {
                 response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
             }
@@ -795,7 +866,7 @@ function handleGameXtCommand(socket, command, params) {
 
             if (gameQuitBattle) {
                 // Remove player from the battle
-                gameQuitBattle.players = gameQuitBattle.players.filter(p => p.id !== socket.userId);
+                gameQuitBattle.players = gameQuitBattle.players.filter(p => p.id !== socket.playerId);
                 console.log(`[GAMEXT_LOG] gameQuit - user ${socket.userId} removed from battle ${gameQuitBattle.name}, ${gameQuitBattle.players.length} players remaining`);
 
                 // If there's only one player left, end the game
@@ -809,7 +880,7 @@ function handleGameXtCommand(socket, command, params) {
                     broadcastToBattle(gameQuitBattle.name, gameOverMsg);
                 } else {
                     // Notify other players that someone quit
-                    const playerQuitMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerQuitGame","userRefId":"${socket.userId}","username":"${users[socket.userId]?.username || 'Unknown'}"}]]></body></msg>\x00`;
+                    const playerQuitMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerQuitGame","userRefId":"${socket.playerId}","username":"${users[socket.userId]?.username || 'Unknown'}"}]]></body></msg>\x00`;
                     console.log(`[GAMEXT_LOG] gameQuit - notifying other players about user ${socket.userId} quitting`);
 
                     broadcastToBattle(gameQuitBattle.name, playerQuitMsg);
@@ -818,7 +889,7 @@ function handleGameXtCommand(socket, command, params) {
                 // Clear the active battle for the socket
                 socket.activeBattle = null;
 
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameQuitConfirmed","userRefId":"${socket.userId}"}]]></body></msg>\x00`;
+                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameQuitConfirmed","userRefId":"${socket.playerId}"}]]></body></msg>\x00`;
                 console.log(`[GAMEXT_LOG] gameQuit completed for user ${socket.userId}`);
             } else {
                 console.log(`[GAMEXT_LOG] gameQuit failed - no active battle for user ${socket.userId}`);
@@ -827,10 +898,17 @@ function handleGameXtCommand(socket, command, params) {
             break;
 
         case 'playerJoinAutoBattle':
-            // Join an auto battle
+            // Join an auto battle (sensei/tutorial: Training = -5, human = 0 in client payload)
             const autoBattleName = params.battleName;
             const gameCreator = params.gameCreator;
-            const gameCreatorId = params.gameCreatorId;
+            let gameCreatorId = params.gameCreatorId;
+            if (gameCreatorId === undefined || gameCreatorId === null) {
+                if (autoBattleName === 'Training') gameCreatorId = '-5';
+                else if (autoBattleName === 'Medium') gameCreatorId = '-4';
+                else if (autoBattleName === 'Easy') gameCreatorId = '-3';
+                else gameCreatorId = '-5';
+            }
+            gameCreatorId = String(gameCreatorId);
 
             // Create or join the auto battle
             if (!battleRooms[autoBattleName]) {
@@ -841,13 +919,13 @@ function handleGameXtCommand(socket, command, params) {
                     maxPlayers: 2,
                     players: [{
                         id: gameCreatorId,
-                        name: gameCreator,
+                        name: gameCreator || autoBattleName,
                         ready: true,
                         nanovorSwarm: [],
                         selectedNanovor: null,
                         enemyTarget: null
                     }, {
-                        id: socket.userId,
+                        id: socket.playerId,
                         name: socket.userName,
                         ready: true,
                         nanovorSwarm: [],
@@ -855,7 +933,7 @@ function handleGameXtCommand(socket, command, params) {
                         enemyTarget: null
                     }],
                     creator: gameCreatorId,
-                    creatorName: gameCreator,
+                    creatorName: gameCreator || autoBattleName,
                     gameState: 'in_progress',
                     turnOrder: [],
                     currentTurn: 0,
@@ -867,7 +945,7 @@ function handleGameXtCommand(socket, command, params) {
                 const existingAutoBattle = battleRooms[autoBattleName];
                 if (existingAutoBattle.players.length < existingAutoBattle.maxPlayers) {
                     existingAutoBattle.players.push({
-                        id: socket.userId,
+                        id: socket.playerId,
                         name: socket.userName,
                         ready: true,
                         nanovorSwarm: [],
@@ -880,17 +958,28 @@ function handleGameXtCommand(socket, command, params) {
             // Update socket's active battle
             socket.activeBattle = autoBattleName;
 
-            // Set up turn order and start the game
+            // Set up turn order and start the game; ensure human players have default swarm
             const finalAutoBattle = battleRooms[autoBattleName];
             finalAutoBattle.turnOrder = [...finalAutoBattle.players];
             finalAutoBattle.gameState = 'in_progress';
+            finalAutoBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(finalAutoBattle, idx); });
 
-            // Send join auto battle message to all players
-            const joinAutoMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerJoinAutoBattle","battleName":"${autoBattleName}","username":"${socket.userName}","userRefId":"${socket.userId}","gameCreator":"${gameCreator}","gameCreatorId":"${gameCreatorId}"}]]></body></msg>\x00`;
+            const senseiBattle = isSenseiBattle(finalAutoBattle);
+            const senseiPayload = senseiBattle ? ',"isSenseiBattle":true' : '';
+            const playersJson = JSON.stringify(playersForClient(finalAutoBattle));
 
+            // Client expects playerJoinAutoBattle BEFORE gameStarted: battleStarted() uses _battleName and _gameCreator set by playerJoinAutoBattle(). Send in that order.
+            const humanPlayer = finalAutoBattle.players.find(p => p.id === socket.playerId);
+            const joinUserRefId = humanPlayer ? clientUserRefId(finalAutoBattle, humanPlayer) : String(socket.playerId);
+            const joinAutoMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerJoinAutoBattle","battleName":"${autoBattleName}","username":"${socket.userName}","userRefId":"${joinUserRefId}","gameCreator":"${gameCreator}","gameCreatorId":"${gameCreatorId}"${senseiPayload}}]]></body></msg>\x00`;
             broadcastToBattle(autoBattleName, joinAutoMsg);
 
-            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"joinedAutoBattle","battleName":"${autoBattleName}","gameCreator":"${gameCreator}","gameCreatorId":"${gameCreatorId}"}]]></body></msg>\x00`;
+            console.log(`[GAMEXT_LOG] gameStarted players (joinUserRefId=${joinUserRefId}):`, playersJson);
+            const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${autoBattleName}","players":${playersJson},"gameCreator":"${finalAutoBattle.creatorName}"${senseiPayload}}]]></body></msg>\x00`;
+            broadcastToBattle(autoBattleName, gameStartMsg);
+
+            // Response: joinedAutoBattle so client does not get gameStarted twice. Client gets both from broadcast in correct order.
+            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"joinedAutoBattle","battleName":"${autoBattleName}","gameCreator":"${gameCreator}","gameCreatorId":"${gameCreatorId}"${senseiPayload}}]]></body></msg>\x00`;
             break;
 
         case 'allPlayersReady':
@@ -905,11 +994,14 @@ function handleGameXtCommand(socket, command, params) {
                     // Start the game if all players are ready
                     readyCheckBattle.gameState = 'in_progress';
 
-                    // Set up turn order
+                    // Set up turn order and ensure default swarm for humans
                     readyCheckBattle.turnOrder = [...readyCheckBattle.players];
+                    readyCheckBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(readyCheckBattle, idx); });
 
-                    // Send game started message to all players
-                    const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${readyCheckBattle.name}","players":${JSON.stringify(readyCheckBattle.players.map(p => ({username: p.name, userRefId: p.id})))},"gameCreator":"${readyCheckBattle.creatorName}"}]]></body></msg>\x00`;
+                    const senseiPayload = isSenseiBattle(readyCheckBattle) ? ',"isSenseiBattle":true' : '';
+                    const readyPlayersJson = JSON.stringify(playersForClient(readyCheckBattle));
+                    console.log(`[GAMEXT_LOG] allPlayersReady gameStarted players:`, readyPlayersJson);
+                    const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${readyCheckBattle.name}","players":${readyPlayersJson},"gameCreator":"${readyCheckBattle.creatorName}"${senseiPayload}}]]></body></msg>\x00`;
 
                     broadcastToBattle(readyCheckBattle.name, gameStartMsg);
 
@@ -947,15 +1039,17 @@ function handleGameXtCommand(socket, command, params) {
             if (startedBattle) {
                 startedBattle.gameState = 'in_progress';
 
-                // Set up turn order
+                // Set up turn order and ensure default swarm for humans
                 startedBattle.turnOrder = [...startedBattle.players];
+                startedBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(startedBattle, idx); });
 
-                // Send game started message to all players
-                const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startedBattle.name}","players":${JSON.stringify(startedBattle.players.map(p => ({username: p.name, userRefId: p.id})))},"gameCreator":"${startedBattle.creatorName}"}]]></body></msg>\x00`;
+                const senseiPayload = isSenseiBattle(startedBattle) ? ',"isSenseiBattle":true' : '';
+                // Send game started message to all players (include selectedSwarmIds)
+                const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startedBattle.name}","players":${JSON.stringify(playersForClient(startedBattle))},"gameCreator":"${startedBattle.creatorName}"${senseiPayload}}]]></body></msg>\x00`;
 
                 broadcastToBattle(startedBattle.name, gameStartMsg);
 
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startedBattle.name}","players":${JSON.stringify(startedBattle.players.map(p => ({username: p.name, userRefId: p.id})))}}]}</body></msg>\x00`;
+                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startedBattle.name}","players":${JSON.stringify(playersForClient(startedBattle))}${senseiPayload}}]]></body></msg>\x00`;
             } else {
                 response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
             }
@@ -972,7 +1066,7 @@ function handleGameXtCommand(socket, command, params) {
                 // Notify other players of the change
                 const swarmValueSetMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameSwarmValueSet","battleName":"${swarmValueBattle.name}","gameSwarmValue":${swarmValue}}]}</body></msg>\x00`;
 
-                broadcastToBattle(swarmValueBattle.name, swarmValueSetMsg, socket.userId);
+                broadcastToBattle(swarmValueBattle.name, swarmValueSetMsg, socket.playerId);
 
                 response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameSwarmValueSet","battleName":"${swarmValueBattle.name}","gameSwarmValue":${swarmValue}}]}</body></msg>\x00`;
             } else {
@@ -991,7 +1085,7 @@ function handleGameXtCommand(socket, command, params) {
                 // Notify other players that this player has set their swarm
                 const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${swarmSelectBattle.name}","swarmCount":${swarmCount},"username":"${username}","userRefId":"${userRefId}"}]]></body></msg>\x00`;
 
-                broadcastToBattle(swarmSelectBattle.name, swarmSelectedMsg, socket.userId);
+                broadcastToBattle(swarmSelectBattle.name, swarmSelectedMsg, socket.playerId);
 
                 response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${swarmSelectBattle.name}","swarmCount":${swarmCount},"username":"${username}","userRefId":"${userRefId}"}]]></body></msg>\x00`;
             } else {
