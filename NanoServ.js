@@ -26,7 +26,7 @@ const battle = require('./battle');
 
 const { findSessionByToken, createUserProfile, saveUserData, loadUserDataByUsername, loadUserData, loadAllUserData } = user;
 const { extractParamsFromRequest, createSrbResponse } = srb;
-const { generateToken, generateAccountId } = utils;
+const { generateToken } = utils;
 const { createGameRoom, getUserGameRoom, advanceTurn } = gameRoomsModule;
 const { sendMessageToUser, broadcastToBattle } = battle;
 

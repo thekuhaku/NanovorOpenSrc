@@ -1,7 +1,7 @@
 const state = require('../../state');
 const user = require('../../user');
 const handleGameXtCommand = require('./gameXt');
-const { users } = state;
+const { users, getNextEmAssetId } = state;
 const { saveUserData } = user;
 
 function handleExtensionCommand(socket, extension, command, params) {
@@ -28,13 +28,25 @@ function handleExtensionCommand(socket, extension, command, params) {
                     response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"avatarUpdated"}]]></body></msg>\x00`;
                     break;
                 case 'getBuddyAvatar':
-                    // _cmd "responseBuddyAvatar" with userRefId, avatarId, nmp
-                    const buddyUser = users[socket.userId] || {};
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"responseBuddyAvatar","userRefId":"${socket.userId}","avatarId":${buddyUser.avatarId || 1},"nmp":${buddyUser.nmp || 0}}]]></body></msg>\x00`;
+                    // Client asks by buddy name (e.g. "Training"); response userRefId must match that player so loadEnemyAvatarPictureById(userRefId,...) updates the correct slot.
+                    const buddyName = (params.name || '').toString().trim();
+                    const senseiRefIds = { 'training': -5, 'medium': -4, 'easy': -3 };
+                    const senseiKey = buddyName.toLowerCase();
+                    let refId = socket.userId;
+                    let bid = 1;
+                    let bnmp = 0;
+                    if (senseiRefIds[senseiKey] !== undefined) {
+                        refId = senseiRefIds[senseiKey];
+                    } else {
+                        const buddyUser = users[socket.userId] || {};
+                        bid = typeof buddyUser.avatarId === 'number' ? buddyUser.avatarId : 1;
+                        bnmp = typeof buddyUser.nmp === 'number' ? buddyUser.nmp : 0;
+                    }
+                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"responseBuddyAvatar","userRefId":${refId},"avatarId":${bid},"nmp":${bnmp}}]]></body></msg>\x00`;
                     break;
                 case 'getUserData':
                 case 'syncUserData':
-                    // Return comprehensive user data (includes nanocash for sync)
+                    // Return comprehensive user data (includes nanocash for sync). No id so client keeps SFS login id.
                     const userData = users[socket.userId] || {};
                     response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"userDataSynced","username":"${socket.userName || 'n'}","avatarId":${userData.avatarId || 1},"nmp":${userData.nmp || 0},"nanocash":${userData.nanocash || 0},"gamesPlayed":${userData.gamesPlayed || 0},"hasSeenNewUserExperience":${userData.hasSeenNewUserExperience || false}}]]></body></msg>\x00`;
                     break;
@@ -93,9 +105,16 @@ function handleExtensionCommand(socket, extension, command, params) {
                     break;
 
                 case 'addEm':
-                    // Add an Energy Matrix to the user's inventory
+                    // Add an Energy Matrix to the user's inventory (EM ids are integers only, no uuid)
                     if (params.emData && users[socket.userId]) {
                         const emData = params.emData;
+                        const parsedId = typeof emData.id === 'number' ? Math.floor(emData.id) : parseInt(emData.id, 10);
+                        if (Number.isNaN(parsedId) || parsedId < 1) {
+                            emData.id = getNextEmAssetId();
+                        } else {
+                            emData.id = parsedId;
+                        }
+                        emData.assetTypeId = typeof emData.assetTypeId === 'number' ? Math.floor(emData.assetTypeId) : (parseInt(emData.assetTypeId, 10) || 0);
 
                         // Ensure emInventory exists
                         if (!users[socket.userId].emInventory) {
@@ -135,7 +154,7 @@ function handleExtensionCommand(socket, extension, command, params) {
                 case 'initialize':  // Initial command sent by client to loginXt extension
                 case 'login':
                 case 'init':
-                    // logOK sends only _cmd, chatRoomName, username
+                    // logOK: do not send id so client uses SFS login id (session.accountId) for battle.
                     response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"logOK","chatRoomName":"Lobby","username":"${socket.userName || 'n'}"}]]></body></msg>\x00`;
                     break;
                 default:
