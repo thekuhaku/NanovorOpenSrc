@@ -127,7 +127,7 @@ CI (`.github/workflows/ci.yml`) runs on push/PR: `npm ci` then `npm run lint` th
 
 ## TODO / Known Gaps
 
-Based on the decompiled client (SmartFox extensions, GameState, TradeState, chat/trade/battle handlers), the following are missing or incomplete:
+The following are missing or incomplete.
 
 ### Battle (gameXt)
 - **Matchmaking** - `createQuickBattle` / `cancelQuickBattle` (find random opponent); currently only sensei/invited battles.
