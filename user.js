@@ -91,7 +91,7 @@ function saveUserData(accountId) {
             ...n,
             id: Number(n.id),
             assetTypeId: Number(n.assetTypeId) || 0,
-            assetId: Number(n.assetId) != null && !Number.isNaN(Number(n.assetId)) ? Number(n.assetId) : Number(n.id)
+            assetId: (() => { const a = Number(n.assetId); return (Number.isFinite(a) && a >= 1) ? a : Number(n.id); })()
         }));
     }
     try {
