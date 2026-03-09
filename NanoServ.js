@@ -29,6 +29,7 @@ const { extractParamsFromRequest, createSrbResponse } = srb;
 const { generateToken } = utils;
 const { createGameRoom, getUserGameRoom, advanceTurn } = gameRoomsModule;
 const { sendMessageToUser, broadcastToBattle } = battle;
+const virmonData = require('./game/virmonData');
 
 // Initialize Express app
 const app = express();
@@ -61,6 +62,7 @@ const { createSfsServer, sfsPort } = require('./sfs/server');
 const sfsServer = createSfsServer();
 
 loadAllUserData();
+virmonData.load();
 
 // Start servers with error handling
 const httpPort = 8443;

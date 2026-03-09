@@ -11,6 +11,27 @@ let socketMap = {};
 let battleRooms = {};
 let battleIdCounter = 1000;
 
+// Buddy system
+let buddies = {};              // accountId -> Set of buddy accountIds
+
+// Chat system
+let pendingPrivateInvites = {}; // inviteeUsernameLower -> inviterUsername
+let privateChatPeers = {};      // usernameLower -> peerUsernameLower
+
+// Trade system
+let pendingTradeInvites = {};   // tradeName -> inviterSocket
+let activeTrades = {};          // tradeName -> { inviter: socket, invitee: socket }
+let tradeStartedIds = {};       // tradeName -> Set of accountIds
+let tradeCurrentOfferer = {};   // tradeName -> accountId
+let tradeCurrentResponder = {}; // tradeName -> accountId
+let tradeResponderAccepted = {};// tradeName -> bool
+let tradeResponderModifiedCart = {}; // tradeName -> bool
+let tradeConfirmedIds = {};     // tradeName -> Set of accountIds
+let tradeCarts = {};            // tradeName -> { accountId: Set of assetIds }
+
+// Buddy invites
+let pendingBuddyInvites = {};  // inviteeUsernameLower -> inviterUsername
+
 /** Integer account IDs. New accounts get next id; loaded accounts advance nextId. */
 let nextAccountId = 1;
 
@@ -46,5 +67,18 @@ module.exports = {
     getNextAccountId,
     setNextAccountIdIfHigher,
     getNextEmAssetId,
-    setNextEmAssetIdIfHigher
+    setNextEmAssetIdIfHigher,
+    buddies,
+    pendingPrivateInvites,
+    privateChatPeers,
+    pendingTradeInvites,
+    activeTrades,
+    tradeStartedIds,
+    tradeCurrentOfferer,
+    tradeCurrentResponder,
+    tradeResponderAccepted,
+    tradeResponderModifiedCart,
+    tradeConfirmedIds,
+    tradeCarts,
+    pendingBuddyInvites
 };

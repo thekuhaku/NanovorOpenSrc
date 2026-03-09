@@ -1,89 +1,1002 @@
+/**
+ * gameXt extension handler ? lobby management + full combat resolution.
+ * Ported from Python: smartfox/handlers/ext_handler.py (game section).
+ *
+ * Lobby commands (createQuickBattle, inviteUser, replyInvitation, setReady, etc.) are
+ * kept from the original NodeJS implementation. Combat resolution (setAttackInfo, endRound)
+ * is a faithful port of the Python battle engine.
+ */
+
 const state = require('../../state');
-const battle = require('../../battle');
+const { sendMessageToUser, broadcastToBattle } = require('../../battle');
 const user = require('../../user');
+const virmonData = require('../../game/virmonData');
+const battleLogic = require('../../game/battle');
 const { users, battleRooms } = state;
-const { sendMessageToUser, broadcastToBattle } = battle;
 const { saveUserData } = user;
 
-/** Sensei (AI) player IDs from sensei-players.xml. */
+// ============================================================================
+// Constants
+// ============================================================================
+
 const SENSEI_IDS = new Set(['-5', '-4', '-3', '-2', '-1', -5, -4, -3, -2, -1]);
 
-/** Client-facing userRefId string. Sensei battles: client uses _userProfile.id=0 for human, so send "0"; sensei keeps their id. */
-function clientUserRefId(battleRoom, p) {
+const SENSEI_DEFAULT_SWARMS = {
+    '-5': [24],
+    '-4': [3, 35, 50, 39],
+    '-3': [11, 24, 6],
+    '-2': [30, 44],
+    '-1': [19, 39],
+};
+
+// Attack action types (client BattleController.handlePerformAttack)
+const ATTACK_TYPE_NONE = 0;
+const ATTACK_TYPE_PASS = 1;
+const ATTACK_TYPE_FIZZLE = 4;
+const ATTACK_TYPE_TARGET_DEAD = 5;
+const ATTACK_TYPE_DODGED = 8;
+
+// Swap action types
+const SWAP_TYPE_SWAP = 0;
+const SWAP_TYPE_BLOCK_SWAP = 1;
+const SWAP_TYPE_NO_SWAP = 2;
+
+// Energy
+const STARTING_ENERGY = 2;
+const ENERGY_GENERATOR = 2;
+
+// Timing
+const SET_ROUND_INFO_DELAY_MS = 700;
+const PERFORM_ATTACK_DELAY_MS = 500;
+const REPLACEMENT_DELAY_MS = 400;
+
+// Matchmaking queue: `${totalPlayers}:${gameSwarmValue}` -> battleName
+const _quickBattleQueue = {};
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function isSenseiBattle(b) {
+    return b && b.players && b.players.some(p => SENSEI_IDS.has(p.id));
+}
+
+function clientUserRefId(b, p) {
     if (!p) return '';
-    if (isSenseiBattle(battleRoom) && !SENSEI_IDS.has(p.id)) return '0';
+    if (isSenseiBattle(b) && !SENSEI_IDS.has(p.id)) return '0';
     return String(p.id);
 }
 
-/** Build player list for client. Players have username, userRefId; we add selectedSwarmIds.
- *  Order: player (positive id) first, then sensei (-5 etc.) so client sees players[0] = local, players[1] = Training. */
-function playersForClient(battleRoom) {
-    if (!battleRoom || !battleRoom.players) return [];
-    const hasSensei = battleRoom.players.some(p => SENSEI_IDS.has(p.id));
-    const list = battleRoom.players.map(p => ({
+function playersForClient(b) {
+    if (!b || !b.players) return [];
+    const hasSensei = b.players.some(p => SENSEI_IDS.has(p.id));
+    const list = b.players.map(p => ({
         username: p.name,
-        userRefId: clientUserRefId(battleRoom, p),
-        selectedSwarmIds: Array.isArray(p.nanovorSwarm) ? p.nanovorSwarm : []
+        userRefId: clientUserRefId(b, p),
+        selectedSwarmIds: Array.isArray(p.nanovorSwarm) ? p.nanovorSwarm : [],
     }));
-    if (hasSensei && list.length === 2) {
-        list.sort((a, b) => Number(b.userRefId) - Number(a.userRefId));
-    }
+    if (hasSensei && list.length === 2) list.sort((a, b2) => Number(b2.userRefId) - Number(a.userRefId));
     return list;
 }
 
-/** Default sensei swarms by userRefId (from sensei-players.xml). */
-const SENSEI_DEFAULT_SWARMS = {
-    '-5': [24],   // Training: Doom Blade
-    '-4': [3, 35, 50, 39],   // Medium
-    '-3': [11, 24, 6],       // Easy
-    '-2': [30, 44],          // " Easy "
-    '-1': [19, 39]           // "  Easy  "
-};
-
-/** True if this battle has a sensei (AI) player. Server sends isSenseiBattle so client can set SENSEI_BATTLE and show tutorial UI. */
-function isSenseiBattle(battleRoom) {
-    return battleRoom && battleRoom.players && battleRoom.players.some(p => SENSEI_IDS.has(p.id));
-}
-
-/** Ensure human player has a default swarm from inventory if empty (e.g. tutorial before setSwarm). Sensei gets default from SENSEI_DEFAULT_SWARMS. */
-function ensureDefaultSwarmForPlayer(battleRoom, playerIndex) {
-    if (!battleRoom || !battleRoom.players || playerIndex < 0 || playerIndex >= battleRoom.players.length) return;
-    const p = battleRoom.players[playerIndex];
+function ensureDefaultSwarmForPlayer(b, playerIndex) {
+    if (!b || !b.players || playerIndex < 0 || playerIndex >= b.players.length) return;
+    const p = b.players[playerIndex];
     if (p.nanovorSwarm && p.nanovorSwarm.length > 0) return;
     const senseiId = String(p.id);
     if (SENSEI_DEFAULT_SWARMS[senseiId]) {
-        p.nanovorSwarm = SENSEI_DEFAULT_SWARMS[senseiId].slice(0);
-        console.log(`[GAMEXT_LOG] Sensei default swarm for ${p.name} (${p.id}): [${p.nanovorSwarm.join(',')}]`);
+        p.nanovorSwarm = SENSEI_DEFAULT_SWARMS[senseiId].slice();
         return;
     }
     const u = users[p.id];
-    if (!u || !u.nanovorInventory || u.nanovorInventory.length === 0) return;
+    if (!u || !u.nanovorInventory || !u.nanovorInventory.length) return;
     const limit = Math.min(2, u.nanovorInventory.length);
-    p.nanovorSwarm = u.nanovorInventory.slice(0, limit).map(n => Number(n.id)).filter(n => !Number.isNaN(n));
-    console.log(`[GAMEXT_LOG] Default swarm for ${p.name} (${p.id}): [${p.nanovorSwarm.join(',')}]`);
+    p.nanovorSwarm = u.nanovorInventory.slice(0, limit).map(n => Number(n.id)).filter(n => !isNaN(n));
 }
+
+/** Build SFS extension message string. */
+function _xt(json) {
+    return `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[${JSON.stringify(json)}]]></body></msg>\x00`;
+}
+
+/** Send JSON extension message to a specific socket. */
+function _sendTo(socket, json) {
+    try { socket.write(_xt(json)); } catch (e) { /* ignore dead socket */ }
+}
+
+/** Find all sockets in a battle by battleName. */
+function _battleSockets(battleName) {
+    const allSockets = [];
+    const sockets = state.socketMap || {};
+    for (const id in sockets) {
+        if (sockets[id] && sockets[id].activeBattle === battleName) allSockets.push(sockets[id]);
+    }
+    return allSockets;
+}
+
+/** Username -> userRefId in battle. */
+function _usernameToUserRef(b, username) {
+    if (!b || !b.players || !username) return null;
+    for (const p of b.players) {
+        if (p.name === username) return String(p.id);
+    }
+    return null;
+}
+
+/** Look up nanovor from user's inventory by instance id. */
+function _getNanovorFromInventory(accountId, nanovorId) {
+    const nid = String(nanovorId);
+    const u = users[accountId];
+    if (!u || !u.nanovorInventory) return null;
+    const nano = u.nanovorInventory.find(n => String(n.id) === nid);
+    if (!nano) return null;
+    const v = virmonData.getVirmon ? virmonData.getVirmon(nano.asset_type_id || nano.assetTypeId) : null;
+    return {
+        instanceId: String(nano.id),
+        assetTypeId: parseInt(nano.asset_type_id || nano.assetTypeId || 1, 10),
+        nickname: String(nano.nickname || ''),
+        speed: parseInt(v ? v.speed : (nano.speed || 10), 10),
+        strength: parseInt(v ? v.strength : (nano.strength || 100), 10),
+        armor: parseInt(v ? v.armor : (nano.armor || 0), 10),
+        health: parseInt(v ? v.health : (nano.health || 100), 10),
+    };
+}
+
+/** Get nanovor state from roundState, bench, or teamState. */
+function _getNanovorStateForPlayer(b, refStr, nid) {
+    nid = String(nid).trim();
+    if (!nid) return {};
+    const roundState = b.roundState || {};
+    const current = roundState[refStr] || {};
+    if (String(current.instanceId || '').trim() === nid) return current;
+    const bench = (b.nanovorBench || {})[refStr] || {};
+    if (bench[nid]) return bench[nid];
+    const teamState = (b.teamState || {})[refStr] || {};
+    return teamState[nid] || {};
+}
+
+// ============================================================================
+// Round Info Helpers
+// ============================================================================
+
+function _minimalSetRoundInfoPlayers(players) {
+    return players.map(p => {
+        const nano = p.selectedNanovor || {};
+        return {
+            userRefId: parseInt(p.userRefId || 0, 10),
+            selectedNanovor: {
+                instanceId: String(nano.instanceId || ''),
+                assetTypeId: parseInt(nano.assetTypeId || 0, 10),
+                nickname: String(nano.nickname || ''),
+                speed: parseInt(nano.speed || 0, 10),
+                strength: parseInt(nano.strength || 0, 10),
+                armor: parseInt(nano.armor || 0, 10),
+                health: parseInt(nano.health || 0, 10),
+            },
+        };
+    });
+}
+
+function _computeTurnOrderUids(players) {
+    const arr = players.map(p => ({
+        uid: parseInt(p.userRefId || 0, 10),
+        speed: parseInt((p.selectedNanovor || {}).speed || 0, 10),
+    }));
+    arr.sort((a, b) => b.speed - a.speed || (Math.random() - 0.5));
+    return arr.map(x => x.uid);
+}
+
+function _orderPlayersByTurnOrder(players, orderedUids) {
+    const idx = {};
+    orderedUids.forEach((uid, i) => { idx[uid] = i; });
+    return players.slice().sort((a, b) => (idx[parseInt(a.userRefId || 0, 10)] || 999) - (idx[parseInt(b.userRefId || 0, 10)] || 999));
+}
+
+// ============================================================================
+// Build Round Info from Attack Choices (round 1)
+// ============================================================================
+
+function _buildRoundInfoFromAttackChoices(b) {
+    const attackChoices = b.attackChoices || {};
+    const players = b.players || [];
+    if (Object.keys(attackChoices).length < players.length || players.length < 2) return false;
+
+    const roundPlayers = [];
+    for (const p of players) {
+        const pUid = String(p.id || p.userRefId || '');
+        const choice = attackChoices[pUid];
+        if (!choice) return false;
+        const nanovorId = parseInt(choice.nanovorId || 0, 10);
+        if (nanovorId <= 0) return false;
+
+        let selectedNanovor = _getNanovorFromInventory(pUid, nanovorId);
+        if (!selectedNanovor) {
+            const team = (b.teamState || {})[pUid] || {};
+            const teamNano = team[String(nanovorId)];
+            if (teamNano) {
+                selectedNanovor = Object.assign({}, teamNano);
+            } else {
+                selectedNanovor = {
+                    instanceId: String(nanovorId),
+                    assetTypeId: 1,
+                    nickname: '',
+                    speed: 10,
+                    strength: 100,
+                    armor: 0,
+                    health: 100,
+                };
+            }
+        }
+        roundPlayers.push({
+            userRefId: parseInt(pUid, 10) || 0,
+            selectedNanovor,
+            energyLevel: STARTING_ENERGY,
+            energyGenerator: ENERGY_GENERATOR,
+            moddedEnergyGenerator: ENERGY_GENERATOR,
+            overrideIds: '',
+        });
+    }
+    if (roundPlayers.length < 2) return false;
+
+    b.roundInfoPayload = { _cmd: 'setRoundInfo', players: roundPlayers };
+    b.roundState = {};
+    b.playerEnergy = {};
+    b.nanovorHacks = {};
+    b.playerOverrides = {};
+    b.nanovorBench = {};
+    for (const pp of roundPlayers) {
+        const ref = String(pp.userRefId);
+        const nano = pp.selectedNanovor;
+        b.roundState[ref] = Object.assign({}, nano);
+        b.playerEnergy[ref] = {
+            energyLevel: STARTING_ENERGY,
+            energyGenerator: ENERGY_GENERATOR,
+            moddedEnergyGenerator: ENERGY_GENERATOR,
+        };
+        b.nanovorBench[ref] = {};
+        const instanceId = String(nano.instanceId || ref);
+        b.nanovorHacks[instanceId] = [];
+        b.playerOverrides[ref] = [];
+    }
+    b.roundInfoSentTo = new Set();
+    return true;
+}
+
+// ============================================================================
+// Core Combat Resolution
+// ============================================================================
+
+function _resolveRoundAttacks(battleName) {
+    const b = battleRooms[battleName];
+    if (!b || !b.roundInfoPayload) return;
+    const playersPayload = b.roundInfoPayload.players || [];
+    if (playersPayload.length < 2) return;
+
+    // Ensure state structures exist
+    let roundState = b.roundState;
+    if (!roundState) {
+        roundState = {};
+        for (const pp of playersPayload) {
+            const ref = String(parseInt(pp.userRefId || 0, 10));
+            roundState[ref] = Object.assign({}, pp.selectedNanovor || {});
+        }
+        b.roundState = roundState;
+    }
+    for (const pp of playersPayload) {
+        const ref = String(parseInt(pp.userRefId || 0, 10));
+        if (!b.nanovorBench) b.nanovorBench = {};
+        if (!b.nanovorBench[ref]) b.nanovorBench[ref] = {};
+    }
+    let playerEnergy = b.playerEnergy;
+    if (!playerEnergy || !Object.keys(playerEnergy).length) {
+        playerEnergy = {};
+        for (const pp of playersPayload) {
+            const ref = String(parseInt(pp.userRefId || 0, 10));
+            playerEnergy[ref] = { energyLevel: STARTING_ENERGY, energyGenerator: ENERGY_GENERATOR, moddedEnergyGenerator: ENERGY_GENERATOR };
+        }
+        b.playerEnergy = playerEnergy;
+    }
+    let nanovorHacks = b.nanovorHacks || {};
+    b.nanovorHacks = nanovorHacks;
+    let playerOverrides = b.playerOverrides || {};
+    b.playerOverrides = playerOverrides;
+
+    const attackChoices = b.attackChoices || {};
+    if (Object.keys(attackChoices).length < 2) return;
+
+    // Build turn order by modded speed
+    const turnOrder = [];
+    for (const [uidStr, choice] of Object.entries(attackChoices)) {
+        const uidInt = parseInt(uidStr, 10);
+        const st = roundState[uidStr] || {};
+        const instanceId = String(st.instanceId || '');
+        const hacks = nanovorHacks[instanceId] || [];
+        const overrides = playerOverrides[uidStr] || [];
+        const moddedSpeed = battleLogic.getModdedSpeed(st, hacks, overrides);
+        turnOrder.push({ uid: uidInt, speed: moddedSpeed, choice });
+    }
+
+    // Use precomputed order if available (from endRound path)
+    let orderedUids;
+    const turnOrderUidSet = new Set(turnOrder.map(t => t.uid));
+    if (b.turn_order_uids && new Set(b.turn_order_uids).size === turnOrderUidSet.size) {
+        let match = true;
+        for (const uid of b.turn_order_uids) if (!turnOrderUidSet.has(uid)) { match = false; break; }
+        orderedUids = match ? b.turn_order_uids : null;
+    }
+    if (!orderedUids) {
+        turnOrder.sort((a, b2) => b2.speed - a.speed || (Math.random() - 0.5));
+        orderedUids = turnOrder.map(t => t.uid);
+        b.turn_order_uids = orderedUids;
+    }
+    const uidToTriple = {};
+    for (const t of turnOrder) uidToTriple[t.uid] = t;
+    const sortedTurnOrder = orderedUids.map(uid => uidToTriple[uid]).filter(Boolean);
+
+    const attackResults = [];
+    const swapRequests = {};
+    const replacementOnlyUids = new Set();
+    let hadDeathThisRound = false;
+
+    // Replacement-after-death: swap dead nanovor BEFORE processing attacks
+    for (const [uidStr, choice] of Object.entries(attackChoices)) {
+        const ref = parseInt(uidStr, 10);
+        const attState = roundState[uidStr] || {};
+        const attInstanceId = String(attState.instanceId || '');
+        const attHealth = parseInt(attState.health || 0, 10);
+        if (attHealth > 0) continue;
+
+        const attackerNanovorId = String(choice.nanovorId || '');
+        const swapNanovorIdChoice = String(choice.swapNanovorId || '0');
+        let replacementId = null;
+        if (attackerNanovorId && attackerNanovorId !== attInstanceId) replacementId = attackerNanovorId;
+        else if (swapNanovorIdChoice && swapNanovorIdChoice !== '0') replacementId = swapNanovorIdChoice;
+        if (!replacementId) continue;
+
+        replacementOnlyUids.add(ref);
+        swapRequests[ref] = replacementId;
+        if (!b.nanovorBench) b.nanovorBench = {};
+        if (!b.nanovorBench[uidStr]) b.nanovorBench[uidStr] = {};
+        b.nanovorBench[uidStr][attInstanceId] = Object.assign({}, attState);
+
+        const benched = (b.nanovorBench[uidStr] || {})[replacementId];
+        if (benched) {
+            roundState[uidStr] = Object.assign({}, benched);
+            if (!nanovorHacks[replacementId]) nanovorHacks[replacementId] = [];
+        } else {
+            const newNano = _getNanovorFromInventory(uidStr, parseInt(replacementId, 10));
+            if (newNano) {
+                roundState[uidStr] = newNano;
+                nanovorHacks[String(parseInt(replacementId, 10))] = [];
+            } else {
+                const teamNano = ((b.teamState || {})[uidStr] || {})[replacementId];
+                if (teamNano) {
+                    roundState[uidStr] = Object.assign({}, teamNano);
+                    nanovorHacks[replacementId] = [];
+                } else {
+                    delete swapRequests[ref];
+                }
+            }
+        }
+    }
+
+    // Snapshot for setRoundInfo before damage (replacement entrance)
+    const roundStateBeforeAttacks = replacementOnlyUids.size > 0
+        ? Object.fromEntries(Object.entries(roundState).map(([k, v]) => [k, Object.assign({}, v)]))
+        : null;
+
+    // -------------------------------------------------------------------------
+    // Process attacks in turn order
+    // -------------------------------------------------------------------------
+    for (const { uid: attackerUid, choice } of sortedTurnOrder) {
+        const attackId = parseInt(choice.attackId || 0, 10);
+        const attackerNanovorId = String(choice.nanovorId || '');
+        const enemyUsername = (choice.enemyUsername || '').trim();
+        const targetUidStr = _usernameToUserRef(b, enemyUsername);
+        const targetUid = targetUidStr ? parseInt(targetUidStr, 10) : null;
+        const swapNanovorId = String(choice.swapNanovorId || '0');
+
+        if (swapNanovorId && swapNanovorId !== '0') swapRequests[attackerUid] = swapNanovorId;
+
+        const attState = roundState[String(attackerUid)] || {};
+        const attAssetType = parseInt(attState.assetTypeId || 1, 10);
+        const attInstanceId = String(attState.instanceId || attackerNanovorId);
+        const attEnergy = playerEnergy[String(attackerUid)] || {};
+        const currentEnergy = attEnergy.energyLevel != null ? attEnergy.energyLevel : STARTING_ENERGY;
+        const attHacks = nanovorHacks[attInstanceId] || [];
+        const attackActions = [];
+        const attOverridesList = playerOverrides[String(attackerUid)] || [];
+        const attackerSelfUpdates = battleLogic.buildTargetUpdatesForClient(
+            attState, attEnergy, attOverridesList, attHacks, [], battleLogic.isSwapBlocked
+        );
+
+        const attHealth = parseInt(attState.health || 0, 10);
+        if (attHealth <= 0) {
+            let replacementIdDead = null;
+            if (attackerNanovorId && attackerNanovorId !== attInstanceId) replacementIdDead = attackerNanovorId;
+            else if (swapNanovorId && swapNanovorId !== '0') replacementIdDead = swapNanovorId;
+            if (replacementIdDead) swapRequests[attackerUid] = replacementIdDead;
+            hadDeathThisRound = true;
+            continue;
+        }
+
+        const attackerStunned = battleLogic.isStunned(attHacks);
+        if (attackerStunned && attackId !== 0) {
+            attackActions.push({
+                targetUserRefId: attackerUid,
+                targetNanovorId: attInstanceId,
+                targetNanovorAssetTypeId: attAssetType,
+                attackStatementId: 0,
+                type: ATTACK_TYPE_PASS,
+                statementClientDescription: 'Stunned!',
+                totalDamage: 0,
+                targetUpdates: attackerSelfUpdates,
+            });
+        } else if (attackId === 0 || targetUid == null) {
+            attackActions.push({
+                targetUserRefId: attackerUid,
+                targetNanovorId: attInstanceId,
+                targetNanovorAssetTypeId: attAssetType,
+                attackStatementId: 0,
+                type: ATTACK_TYPE_PASS,
+                statementClientDescription: 'Pass',
+                totalDamage: 0,
+                targetUpdates: attackerSelfUpdates,
+            });
+        } else {
+            // Real attack
+            const attackCost = virmonData.getAttackCost(attAssetType, attackId);
+            if (currentEnergy < attackCost) {
+                attackActions.push({
+                    targetUserRefId: attackerUid,
+                    targetNanovorId: attInstanceId,
+                    targetNanovorAssetTypeId: attAssetType,
+                    attackStatementId: 0,
+                    type: ATTACK_TYPE_FIZZLE,
+                    statementClientDescription: 'Not enough energy!',
+                    totalDamage: 0,
+                    targetUpdates: attackerSelfUpdates,
+                });
+            } else {
+                attEnergy.energyLevel = currentEnergy - attackCost;
+
+                const tgtState = roundState[String(targetUid)] || {};
+                const tgtNanovorId = String(tgtState.instanceId || '');
+                const tgtAssetType = parseInt(tgtState.assetTypeId || 1, 10);
+                const tgtHacks = nanovorHacks[tgtNanovorId] || [];
+                const attOverrides = playerOverrides[String(attackerUid)] || [];
+                const tgtOverrides = playerOverrides[String(targetUid)] || [];
+
+                const { statementId, totalDamage, clientDesc, wasDodged, isHealthDamage } = battleLogic.resolveAttackDamage(
+                    Object.assign({}, attState), tgtState, attAssetType, attackId,
+                    attHacks, attOverrides, tgtHacks, tgtOverrides
+                );
+
+                battleLogic.applySelfDamageFromAttack(attState, attAssetType, attackId, attHacks, attOverrides);
+
+                if (wasDodged) {
+                    const tgtEnergy = playerEnergy[String(targetUid)] || {};
+                    const targetUpdates = battleLogic.buildTargetUpdatesForClient(
+                        tgtState, tgtEnergy, tgtOverrides, tgtHacks, attOverrides, battleLogic.isSwapBlocked
+                    );
+                    attackActions.push({
+                        targetUserRefId: targetUid,
+                        targetNanovorId: tgtNanovorId,
+                        targetNanovorAssetTypeId: tgtAssetType,
+                        attackStatementId: 0,
+                        type: ATTACK_TYPE_DODGED,
+                        statementClientDescription: 'Dodged!',
+                        totalDamage: 0,
+                        targetUpdates,
+                    });
+                } else {
+                    if (isHealthDamage) {
+                        const newHealth = parseInt(tgtState.health || 0, 10);
+                        if (newHealth <= 0) hadDeathThisRound = true;
+                        attackActions.push({
+                            targetUserRefId: targetUid,
+                            targetNanovorId: tgtNanovorId,
+                            targetNanovorAssetTypeId: tgtAssetType,
+                            attackStatementId: statementId,
+                            type: ATTACK_TYPE_NONE,
+                            statementClientDescription: clientDesc,
+                            totalDamage,
+                            value: newHealth,
+                            targetUpdates: null,
+                        });
+                    }
+                }
+
+                // Apply hacks
+                const { newAttackerHacks, newTargetHacks } = battleLogic.applyHacksFromAttack(
+                    attState, tgtState, attHacks, tgtHacks, attAssetType, attackId, attOverrides
+                );
+                if (newAttackerHacks.length) {
+                    if (!nanovorHacks[attInstanceId]) nanovorHacks[attInstanceId] = [];
+                    nanovorHacks[attInstanceId].push(...newAttackerHacks);
+                }
+                if (newTargetHacks.length) {
+                    if (!nanovorHacks[tgtNanovorId]) nanovorHacks[tgtNanovorId] = [];
+                    nanovorHacks[tgtNanovorId].push(...newTargetHacks);
+                }
+
+                // Delete Override Mod
+                const { removesOwn, removesEnemy, clearStatementId } = battleLogic.checkDeleteOverrideMod(attAssetType, attackId, attOverrides);
+                if (removesOwn) playerOverrides[String(attackerUid)] = [];
+                if (removesEnemy) playerOverrides[String(targetUid)] = [];
+
+                // Apply overrides
+                const curAttOverrides = playerOverrides[String(attackerUid)] || [];
+                const curTgtOverrides = playerOverrides[String(targetUid)] || [];
+                const { newAttackerOverrides, newTargetOverrides, clearAttacker, clearTarget } = battleLogic.applyOverridesFromAttack(
+                    String(attackerUid), String(targetUid), curAttOverrides, curTgtOverrides, attAssetType, attackId
+                );
+                if (clearAttacker && newAttackerOverrides.length) playerOverrides[String(attackerUid)] = newAttackerOverrides;
+                else if (newAttackerOverrides.length) {
+                    if (!playerOverrides[String(attackerUid)]) playerOverrides[String(attackerUid)] = [];
+                    playerOverrides[String(attackerUid)].push(...newAttackerOverrides);
+                }
+                if (clearTarget && newTargetOverrides.length) playerOverrides[String(targetUid)] = newTargetOverrides;
+                else if (newTargetOverrides.length) {
+                    if (!playerOverrides[String(targetUid)]) playerOverrides[String(targetUid)] = [];
+                    playerOverrides[String(targetUid)].push(...newTargetOverrides);
+                }
+
+                // Mod-only attacks: targetUpdates for enemy override removal
+                if (!wasDodged && !isHealthDamage && removesEnemy) {
+                    const tgtEnergyAfter = playerEnergy[String(targetUid)] || {};
+                    const tgtOverridesAfter = playerOverrides[String(targetUid)] || [];
+                    const tgtHacksAfter = nanovorHacks[tgtNanovorId] || [];
+                    const targetUpdates = battleLogic.buildTargetUpdatesForClient(
+                        tgtState, tgtEnergyAfter, tgtOverridesAfter, tgtHacksAfter, attOverrides, battleLogic.isSwapBlocked
+                    );
+                    attackActions.push({
+                        targetUserRefId: targetUid,
+                        targetNanovorId: tgtNanovorId,
+                        targetNanovorAssetTypeId: tgtAssetType,
+                        attackStatementId: clearStatementId || 0,
+                        type: ATTACK_TYPE_NONE,
+                        statementClientDescription: 'Override removed',
+                        totalDamage: 0,
+                        targetUpdates,
+                    });
+                }
+
+                const attackerGainedOverrides = !!newAttackerOverrides.length;
+
+                // Energy mods
+                const { attackerChange: attEnergyChange, targetChange: tgtEnergyChange } = battleLogic.getEnergyModsFromAttack(attAssetType, attackId, attOverrides);
+                if (attEnergyChange !== 0) attEnergy.energyLevel = Math.max(0, (attEnergy.energyLevel || 0) + attEnergyChange);
+                if (tgtEnergyChange !== 0) {
+                    const tgtEnergyDict = playerEnergy[String(targetUid)] || {};
+                    tgtEnergyDict.energyLevel = Math.max(0, (tgtEnergyDict.energyLevel || 0) + tgtEnergyChange);
+                }
+
+                // Stat mods
+                const statMods = battleLogic.getStatModsFromAttack(attAssetType, attackId, attOverrides);
+                for (const mod of statMods) {
+                    const targetType = mod.target;
+                    if (targetType === 'Enemy active Virmon' || targetType === 'Enemy team')
+                        battleLogic.applyStatModToState(tgtState, mod.stat, mod.verb, mod.value);
+                    else if (targetType === 'My active Virmon' || targetType === 'My team')
+                        battleLogic.applyStatModToState(attState, mod.stat, mod.verb, mod.value);
+                    else if (targetType === 'All active Virmon' || targetType === 'All teams') {
+                        battleLogic.applyStatModToState(attState, mod.stat, mod.verb, mod.value);
+                        battleLogic.applyStatModToState(tgtState, mod.stat, mod.verb, mod.value);
+                    }
+                }
+
+                if (statMods.length && attackActions.length) {
+                    const modDesc = battleLogic.formatStatModsForClientDescription(statMods, true) + battleLogic.formatStatModsForClientDescription(statMods, false);
+                    if (modDesc) {
+                        attackActions[attackActions.length - 1].statementClientDescription = (attackActions[attackActions.length - 1].statementClientDescription || '') + modDesc;
+                    }
+                }
+
+                // Per-stat-mod actions for enemy
+                for (const mod of statMods) {
+                    if (mod.stat === 'Health') continue;
+                    if (mod.target !== 'Enemy active Virmon' && mod.target !== 'Enemy team') continue;
+                    const stId = mod.statement_id || 0;
+                    if (!stId) continue;
+                    const statKey = battleLogic.STAT_MAP[mod.stat] || mod.stat.toLowerCase();
+                    const newStatValue = parseInt(tgtState[statKey] || 0, 10);
+                    const magnitude = Math.abs(Math.round(mod.value || 0));
+                    if (!magnitude) continue;
+                    attackActions.push({
+                        targetUserRefId: targetUid,
+                        targetNanovorId: tgtNanovorId,
+                        targetNanovorAssetTypeId: tgtAssetType,
+                        attackStatementId: stId,
+                        type: ATTACK_TYPE_NONE,
+                        statementClientDescription: '',
+                        totalDamage: magnitude,
+                        value: newStatValue,
+                        targetUpdates: null,
+                    });
+                }
+
+                // Final targetUpdates for target
+                const tgtEnergyFinal = playerEnergy[String(targetUid)] || {};
+                const tgtOverridesFinal = playerOverrides[String(targetUid)] || [];
+                const tgtHacksFinal = nanovorHacks[tgtNanovorId] || [];
+                const attOverridesFinal = playerOverrides[String(attackerUid)] || [];
+                const targetUpdates = battleLogic.buildTargetUpdatesForClient(
+                    tgtState, tgtEnergyFinal, tgtOverridesFinal, tgtHacksFinal, attOverridesFinal, battleLogic.isSwapBlocked
+                );
+                if (attackActions.length) {
+                    attackActions[attackActions.length - 1].targetUpdates = targetUpdates;
+                    for (const act of attackActions) {
+                        if (act.targetUpdates == null && act.targetUserRefId === targetUid) act.targetUpdates = targetUpdates;
+                    }
+                }
+
+                // Self-update for attacker override state change
+                if (removesOwn || attackerGainedOverrides) {
+                    const attEnergyAfter = playerEnergy[String(attackerUid)] || {};
+                    const attHacksAfter = nanovorHacks[attInstanceId] || [];
+                    const attOverridesAfterSelf = playerOverrides[String(attackerUid)] || [];
+                    const attackerUpdates = battleLogic.buildTargetUpdatesForClient(
+                        attState, attEnergyAfter, attOverridesAfterSelf, attHacksAfter, [], battleLogic.isSwapBlocked
+                    );
+                    let stIdSelf = 0;
+                    if (removesOwn) {
+                        stIdSelf = clearStatementId;
+                        if (!stIdSelf) {
+                            const sts = virmonData.getAttackStatements(attAssetType, attackId);
+                            stIdSelf = sts.length ? parseInt(sts[0].statement_id || 0, 10) : 0;
+                        }
+                    } else {
+                        stIdSelf = newAttackerOverrides.length ? parseInt(newAttackerOverrides[0].statement_id || 0, 10) : 0;
+                        if (!stIdSelf) {
+                            const sts = virmonData.getAttackStatements(attAssetType, attackId);
+                            stIdSelf = sts.length ? parseInt(sts[0].statement_id || 0, 10) : 0;
+                        }
+                    }
+                    attackActions.push({
+                        targetUserRefId: attackerUid,
+                        targetNanovorId: attInstanceId,
+                        targetNanovorAssetTypeId: attAssetType,
+                        attackStatementId: stIdSelf,
+                        type: ATTACK_TYPE_NONE,
+                        statementClientDescription: '',
+                        totalDamage: 0,
+                        value: parseInt(attState.health || 0, 10),
+                        targetUpdates: attackerUpdates,
+                    });
+                } else if (battleLogic.attackHasSelfDamage(attAssetType, attackId)) {
+                    const attEnergyAfter = playerEnergy[String(attackerUid)] || {};
+                    const attHacksAfter = nanovorHacks[attInstanceId] || [];
+                    const attOverridesAfterSelf = playerOverrides[String(attackerUid)] || [];
+                    const attackerUpdates = battleLogic.buildTargetUpdatesForClient(
+                        attState, attEnergyAfter, attOverridesAfterSelf, attHacksAfter, [], battleLogic.isSwapBlocked
+                    );
+                    attackActions.push({
+                        targetUserRefId: attackerUid,
+                        targetNanovorId: attInstanceId,
+                        targetNanovorAssetTypeId: attAssetType,
+                        attackStatementId: 0,
+                        type: ATTACK_TYPE_NONE,
+                        statementClientDescription: '',
+                        totalDamage: 0,
+                        value: parseInt(attState.health || 0, 10),
+                        targetUpdates: attackerUpdates,
+                    });
+                }
+            }
+        }
+
+        attackResults.push({
+            attackerId: attackerUid,
+            attackerNanovorId: attInstanceId,
+            attackerNanovorAssetId: attAssetType,
+            attackId,
+            attackActions,
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Process swaps
+    // -------------------------------------------------------------------------
+    const swapActions = [];
+    for (const pp of playersPayload) {
+        const ref = parseInt(pp.userRefId || 0, 10);
+        const currentState = roundState[String(ref)] || {};
+        const currentInstanceId = String(currentState.instanceId || '');
+        const currentHacks = nanovorHacks[currentInstanceId] || [];
+        const swapNanovorId = swapRequests[ref];
+
+        if (swapNanovorId) {
+            if (replacementOnlyUids.has(ref)) {
+                swapActions.push({ userRefId: ref, type: SWAP_TYPE_NO_SWAP });
+            } else if (String(swapNanovorId) === currentInstanceId) {
+                swapActions.push({ userRefId: ref, type: SWAP_TYPE_NO_SWAP });
+            } else if (battleLogic.isSwapBlocked(currentHacks)) {
+                swapActions.push({ userRefId: ref, type: SWAP_TYPE_BLOCK_SWAP });
+            } else {
+                swapActions.push({ userRefId: ref, type: SWAP_TYPE_SWAP, instanceId: swapNanovorId, assetTypeId: 0 });
+                if (!b.nanovorBench) b.nanovorBench = {};
+                if (!b.nanovorBench[String(ref)]) b.nanovorBench[String(ref)] = {};
+                b.nanovorBench[String(ref)][currentInstanceId] = Object.assign({}, currentState);
+
+                const benched = (b.nanovorBench[String(ref)] || {})[swapNanovorId];
+                if (benched) {
+                    const newNano = Object.assign({}, benched);
+                    swapActions[swapActions.length - 1].assetTypeId = parseInt(newNano.assetTypeId || 0, 10);
+                    roundState[String(ref)] = newNano;
+                    if (!nanovorHacks[swapNanovorId]) nanovorHacks[swapNanovorId] = [];
+                } else {
+                    const newNanoFromInv = _getNanovorFromInventory(String(ref), parseInt(swapNanovorId, 10));
+                    if (newNanoFromInv) {
+                        roundState[String(ref)] = newNanoFromInv;
+                        swapActions[swapActions.length - 1].assetTypeId = newNanoFromInv.assetTypeId;
+                        nanovorHacks[String(parseInt(swapNanovorId, 10))] = [];
+                    } else {
+                        const teamNano = ((b.teamState || {})[String(ref)] || {})[swapNanovorId];
+                        if (teamNano) {
+                            roundState[String(ref)] = Object.assign({}, teamNano);
+                            swapActions[swapActions.length - 1].assetTypeId = parseInt(teamNano.assetTypeId || 0, 10);
+                            nanovorHacks[swapNanovorId] = [];
+                        }
+                    }
+                }
+            }
+        } else {
+            swapActions.push({ userRefId: ref, type: SWAP_TYPE_NO_SWAP });
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Hack/override duration decrement
+    // -------------------------------------------------------------------------
+    for (const instanceId of Object.keys(nanovorHacks)) {
+        nanovorHacks[instanceId] = battleLogic.decrementHackDurations(nanovorHacks[instanceId]);
+    }
+    for (const uidStr of Object.keys(playerOverrides)) {
+        playerOverrides[uidStr] = battleLogic.decrementOverrideDurations(playerOverrides[uidStr]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Energy regeneration
+    // -------------------------------------------------------------------------
+    for (const pp of playersPayload) {
+        const ref = String(parseInt(pp.userRefId || 0, 10));
+        const energy = playerEnergy[ref] || {};
+        const generator = energy.moddedEnergyGenerator != null ? energy.moddedEnergyGenerator : ENERGY_GENERATOR;
+        energy.energyLevel = (energy.energyLevel || 0) + generator;
+    }
+
+    // -------------------------------------------------------------------------
+    // Build round results players
+    // -------------------------------------------------------------------------
+    const roundInfoPlayers = (b.roundInfoPayload || {}).players || [];
+    const roundResultsPlayers = [];
+    for (const pp of playersPayload) {
+        const ref = parseInt(pp.userRefId || 0, 10);
+        let st = roundState[String(ref)] || {};
+        if (!st || !String(st.instanceId || '').trim()) {
+            for (const rp of roundInfoPlayers) {
+                if (parseInt(rp.userRefId || -1, 10) === ref) {
+                    st = Object.assign({}, rp.selectedNanovor || {});
+                    break;
+                }
+            }
+        }
+        if (!String(st.instanceId || '').trim()) {
+            st = { instanceId: '0', assetTypeId: 0, nickname: '', speed: 0, strength: 0, armor: 0, health: 0 };
+        }
+        const energy = playerEnergy[String(ref)] || {};
+        const instanceId = String(st.instanceId || '');
+        const hacks = nanovorHacks[instanceId] || [];
+        const overrides = playerOverrides[String(ref)] || [];
+
+        const selectedNano = Object.assign({}, st);
+        selectedNano.hacks = battleLogic.formatHacksForClient(hacks);
+
+        const overrideIdsStr = battleLogic.formatOverridesForClient(overrides);
+        roundResultsPlayers.push({
+            userRefId: ref,
+            energyLevel: energy.energyLevel || 0,
+            energyGenerator: energy.energyGenerator || ENERGY_GENERATOR,
+            moddedEnergyGenerator: energy.moddedEnergyGenerator || ENERGY_GENERATOR,
+            swapPercentage: battleLogic.isSwapBlocked(hacks) ? 0 : 100,
+            moddedSwapPercentage: battleLogic.isSwapBlocked(hacks) ? 0 : 100,
+            overrideIds: overrideIdsStr || null,
+            selectedNanovor: selectedNano,
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Ensure no null targetUpdates (client crashes)
+    // -------------------------------------------------------------------------
+    for (const ar of attackResults) {
+        const actions = ar.attackActions || [];
+        let fallbackTu = null;
+        for (const act of actions) { if (act.targetUpdates != null) { fallbackTu = act.targetUpdates; break; } }
+        for (const act of actions) { if (act.targetUpdates == null && fallbackTu != null) act.targetUpdates = fallbackTu; }
+    }
+
+    const performPayload = { _cmd: 'performAttack', attackResults };
+    const battleSockets = _battleSockets(battleName);
+
+    // -------------------------------------------------------------------------
+    // Send messages with delays via setTimeout chain
+    // -------------------------------------------------------------------------
+    let delay = 0;
+
+    if (replacementOnlyUids.size > 0 && roundStateBeforeAttacks) {
+        const roundNum = b.round || 1;
+        const minimalRoundPlayers = [];
+        for (const pp of roundInfoPlayers) {
+            const ref = parseInt(pp.userRefId || 0, 10);
+            const st = roundStateBeforeAttacks[String(ref)] || roundState[String(ref)] || {};
+            minimalRoundPlayers.push({ userRefId: ref, selectedNanovor: Object.assign({}, st) });
+        }
+        const minimal = _minimalSetRoundInfoPlayers(minimalRoundPlayers);
+        const ordered = _orderPlayersByTurnOrder(minimal, orderedUids);
+        const setRoundMsg = { _cmd: 'setRoundInfo', players: ordered, round: roundNum };
+        for (const s of battleSockets) _sendTo(s, setRoundMsg);
+        delay += REPLACEMENT_DELAY_MS;
+    }
+
+    setTimeout(() => {
+        for (const s of battleSockets) _sendTo(s, performPayload);
+        setTimeout(() => {
+            for (const s of battleSockets) {
+                const cUid = parseInt(s.userId || s.playerId || 0, 10);
+                const orderedPlayers = roundResultsPlayers.slice().sort((a, b2) => a.userRefId === cUid ? -1 : b2.userRefId === cUid ? 1 : 0);
+                _sendTo(s, {
+                    _cmd: 'roundCompleted',
+                    swapActions,
+                    players: orderedPlayers,
+                    attackResults,
+                });
+            }
+        }, PERFORM_ATTACK_DELAY_MS);
+    }, delay);
+
+    // -------------------------------------------------------------------------
+    // Update state for next round
+    // -------------------------------------------------------------------------
+    b.attackChoices = {};
+    for (const pp of (b.roundInfoPayload || {}).players || []) {
+        const ref = String(pp.userRefId || 0);
+        if (roundState[ref]) pp.selectedNanovor = Object.assign({}, roundState[ref]);
+    }
+    b.roundState = roundState;
+    b.sendSetRoundInfoBeforeNextResolve = !!(replacementOnlyUids.size || hadDeathThisRound);
+
+    // -------------------------------------------------------------------------
+    // Game over detection
+    // -------------------------------------------------------------------------
+    let loserRef = null;
+    const swarmIds = b.swarmIds || {};
+    for (const pp of playersPayload) {
+        const ref = parseInt(pp.userRefId || 0, 10);
+        if (swapRequests[ref]) continue;
+        const team = (swarmIds[String(ref)] || swarmIds[ref] || []).map(String);
+        if (!team.length) continue;
+        let allDead = true;
+        for (const nid of team) {
+            const s = _getNanovorStateForPlayer(b, String(ref), nid);
+            if (parseInt(s.health || 0, 10) > 0) { allDead = false; break; }
+        }
+        if (allDead) { loserRef = ref; break; }
+    }
+
+    if (loserRef != null) {
+        const winnerRef = playersPayload.map(pp => parseInt(pp.userRefId || 0, 10)).find(r => r !== loserRef);
+        if (winnerRef != null) {
+            const results = playersPayload.map(pp => {
+                const ref = parseInt(pp.userRefId || 0, 10);
+                return {
+                    userRefId: ref,
+                    position: ref === winnerRef ? 1 : 2,
+                    totalDamage: 0,
+                    totalNanovorKilled: 0,
+                    nmpDiff: 0,
+                };
+            });
+            b.gameOver = { winnerId: winnerRef, results };
+
+            if (users[winnerRef]) {
+                users[winnerRef].nanocash = (users[winnerRef].nanocash || 0) + 50;
+                saveUserData(winnerRef);
+            }
+            if (users[loserRef]) {
+                users[loserRef].nanocash = (users[loserRef].nanocash || 0) + 25;
+                saveUserData(loserRef);
+            }
+
+            const totalDelay = delay + PERFORM_ATTACK_DELAY_MS + 100;
+            setTimeout(() => {
+                const goMsg = { _cmd: 'gameOver', winnerId: winnerRef, results };
+                for (const s of battleSockets) _sendTo(s, goMsg);
+                for (const s of battleSockets) s.activeBattle = null;
+                delete battleRooms[battleName];
+                for (const [key, val] of Object.entries(_quickBattleQueue)) {
+                    if (val === battleName) { delete _quickBattleQueue[key]; break; }
+                }
+            }, totalDelay);
+        }
+    }
+}
+
+// ============================================================================
+// Main Handler
+// ============================================================================
 
 function handleGameXtCommand(socket, command, params) {
     if (socket.playerId == null && socket.userId != null) socket.playerId = socket.userId;
-    console.log(`[GAMEXT_LOG] Handling gameXt command: ${command}`, params);
 
     let response = '';
 
     switch (command) {
-        case 'createQuickBattle':
-            console.log(`[GAMEXT_LOG] createQuickBattle command called by user ${socket.userId} (${socket.userName})`, params);
-            // Create a quick battle with specified parameters
+        case 'createQuickBattle': {
             const gameSwarmValue = params.gameSwarmValue || 1000;
             const totalPlayers = params.totalPlayers || 2;
+            const queueKey = `${totalPlayers}:${gameSwarmValue}`;
 
-            // Generate a unique battle name
+            const existingBattleName = _quickBattleQueue[queueKey];
+            if (existingBattleName && battleRooms[existingBattleName]) {
+                const existingBattle = battleRooms[existingBattleName];
+                if (existingBattle.creator !== socket.playerId && existingBattle.players.length < existingBattle.maxPlayers) {
+                    delete _quickBattleQueue[queueKey];
+                    existingBattle.players.push({
+                        id: socket.playerId,
+                        name: socket.userName,
+                        ready: false,
+                        nanovorSwarm: [],
+                        selectedNanovor: null,
+                        enemyTarget: null,
+                    });
+                    socket.activeBattle = existingBattleName;
+
+                    sendMessageToUser(existingBattle.creator, _xt({
+                        _cmd: 'invitationResponse',
+                        battleName: existingBattleName,
+                        player: { username: socket.userName, userRefId: parseInt(socket.playerId, 10), acceptedInvitation: true },
+                        inviterName: existingBattle.creatorName,
+                        inviterId: String(existingBattle.creator),
+                    }));
+                    sendMessageToUser(existingBattle.creator, _xt({
+                        _cmd: 'playerJoinGame',
+                        battleName: existingBattleName,
+                        username: socket.userName,
+                        userRefId: parseInt(socket.playerId, 10),
+                        creator: false,
+                    }));
+
+                    _sendTo(socket, {
+                        _cmd: 'playerJoinAutoBattle',
+                        battleName: existingBattleName,
+                        gameCreator: existingBattle.creatorName,
+                        gameCreatorId: String(existingBattle.creator),
+                        username: socket.userName,
+                        userRefId: parseInt(socket.playerId, 10),
+                    });
+                    _sendTo(socket, {
+                        _cmd: 'invitationResponse',
+                        battleName: existingBattleName,
+                        otherPlayers: [{
+                            battleName: existingBattleName,
+                            username: existingBattle.creatorName,
+                            userRefId: parseInt(existingBattle.creator, 10),
+                        }],
+                    });
+
+                    const ps = existingBattle.players.map(p => ({ username: p.name, userRefId: parseInt(p.id, 10) }));
+                    const gsPayload = { _cmd: 'gameStarted', battleName: existingBattleName, players: ps, gameCreator: existingBattle.creatorName };
+                    broadcastToBattle(existingBattleName, _xt(gsPayload));
+                    return;
+                }
+            }
+
             const newBattleName = `quick_battle_${Date.now()}_${socket.userId}`;
-
-            // Create battle room
-            const battleRoom = {
+            battleRooms[newBattleName] = {
                 id: state.battleIdCounter++,
                 name: newBattleName,
-                gameSwarmValue: gameSwarmValue,
+                gameSwarmValue,
                 maxPlayers: totalPlayers,
                 players: [{
                     id: socket.playerId,
@@ -91,47 +1004,7 @@ function handleGameXtCommand(socket, command, params) {
                     ready: false,
                     nanovorSwarm: [],
                     selectedNanovor: null,
-                    enemyTarget: null
-                }],
-                creator: socket.playerId,
-                creatorName: socket.userName,
-                gameState: 'waiting_for_players', // waiting_for_players, in_progress, finished
-                turnOrder: [],
-                currentTurn: 0,
-                round: 1,
-                battleHistory: []
-            };
-
-            battleRooms[newBattleName] = battleRoom;
-
-            // Update socket's active battle
-            socket.activeBattle = newBattleName;
-
-            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameCreated","battleName":"${newBattleName}","gameCreator":"${socket.userName}","convertedChatRoom":false}]]></body></msg>\x00`;
-            console.log(`[GAMEXT_LOG] createQuickBattle completed, battle created: ${newBattleName}`);
-            break;
-
-        case 'createGame':
-            // Create a custom game
-            const customSwarmValue = params.gameSwarmValue || 1000;
-            const convertedChatRoom = params.convertedChatRoom || false;
-
-            // Generate a unique battle name
-            const customBattleName = `custom_battle_${Date.now()}_${socket.userId}`;
-
-            // Create battle room
-            const customBattleRoom = {
-                id: state.battleIdCounter++,
-                name: customBattleName,
-                gameSwarmValue: customSwarmValue,
-                maxPlayers: 2, // Default to 2 players
-                players: [{
-                    id: socket.playerId,
-                    name: socket.userName,
-                    ready: false,
-                    nanovorSwarm: [],
-                    selectedNanovor: null,
-                    enemyTarget: null
+                    enemyTarget: null,
                 }],
                 creator: socket.playerId,
                 creatorName: socket.userName,
@@ -139,770 +1012,385 @@ function handleGameXtCommand(socket, command, params) {
                 turnOrder: [],
                 currentTurn: 0,
                 round: 1,
-                battleHistory: []
+                battleHistory: [],
             };
-
-            battleRooms[customBattleName] = customBattleRoom;
-
-            // Update socket's active battle
-            socket.activeBattle = customBattleName;
-
-            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameCreated","battleName":"${customBattleName}","gameCreator":"${socket.userName}","convertedChatRoom":${convertedChatRoom}}]]></body></msg>\x00`;
+            socket.activeBattle = newBattleName;
+            _quickBattleQueue[queueKey] = newBattleName;
+            response = _xt({ _cmd: 'gameCreated', battleName: newBattleName, gameCreator: socket.userName, convertedChatRoom: false });
             break;
+        }
 
-        case 'inviteUser':
-            // Invite a user to a battle
-            const invitee = params.buddy; // Username of the person to invite
+        case 'createGame': {
+            const customSwarmValue = params.gameSwarmValue || 1000;
+            const convertedChatRoom = params.convertedChatRoom || false;
+            const customBattleName = `custom_battle_${Date.now()}_${socket.userId}`;
+            battleRooms[customBattleName] = {
+                id: state.battleIdCounter++,
+                name: customBattleName,
+                gameSwarmValue: customSwarmValue,
+                maxPlayers: 2,
+                players: [{ id: socket.playerId, name: socket.userName, ready: false, nanovorSwarm: [], selectedNanovor: null, enemyTarget: null }],
+                creator: socket.playerId,
+                creatorName: socket.userName,
+                gameState: 'waiting_for_players',
+                turnOrder: [],
+                currentTurn: 0,
+                round: 1,
+                battleHistory: [],
+            };
+            socket.activeBattle = customBattleName;
+            response = _xt({ _cmd: 'gameCreated', battleName: customBattleName, gameCreator: socket.userName, convertedChatRoom });
+            break;
+        }
+
+        case 'inviteUser': {
+            const invitee = params.buddy;
             const battleToInvite = params.battleName;
             const convertedRoom = params.convertedChatRoom || false;
-
-            // Find the user ID for the invitee
             let inviteeId = null;
             for (const userId in users) {
-                if (users[userId].username === invitee) {
-                    inviteeId = userId;
-                    break;
-                }
+                if (users[userId].username === invitee) { inviteeId = userId; break; }
             }
-
             if (inviteeId) {
-                // Send invitation to the invitee
-                const invitationMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationRequest","battleName":"${battleToInvite}","inviter":{"username":"${socket.userName}","userRefId":"${socket.playerId}"},"gameSwarmValue":${battleRooms[battleToInvite]?.gameSwarmValue || 1000},"convertedChatRoom":${convertedRoom}}]]></body></msg>\x00`;
-
-                if (sendMessageToUser(inviteeId, invitationMsg)) {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationSent","battleName":"${battleToInvite}","invitedUser":"${invitee}"}]]></body></msg>\x00`;
+                const invMsg = _xt({
+                    _cmd: 'invitationRequest',
+                    battleName: battleToInvite,
+                    inviter: { username: socket.userName, userRefId: socket.playerId },
+                    gameSwarmValue: (battleRooms[battleToInvite] || {}).gameSwarmValue || 1000,
+                    convertedChatRoom: convertedRoom,
+                });
+                if (sendMessageToUser(inviteeId, invMsg)) {
+                    response = _xt({ _cmd: 'invitationSent', battleName: battleToInvite, invitedUser: invitee });
                 } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameInvitationError","errorMessage":"Player offline"}]]></body></msg>\x00`;
+                    response = _xt({ _cmd: 'gameInvitationError', errorMessage: 'Player offline' });
                 }
             } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameInvitationError","errorMessage":"Player not found"}]]></body></msg>\x00`;
+                response = _xt({ _cmd: 'gameInvitationError', errorMessage: 'Player not found' });
             }
             break;
+        }
 
-        case 'replyInvitation':
-            // Reply to a battle invitation (accept/decline)
+        case 'replyInvitation': {
             const battleName = params.battleName;
             const accept = params.accept;
             const replyReason = params.replyReason || 'ACCEPTED';
-
             if (accept) {
-                // User accepted the invitation
-                const battleRoom = battleRooms[battleName];
-
-                if (battleRoom) {
-                    // Add the user to the battle room if there's space
-                    if (battleRoom.players.length < battleRoom.maxPlayers) {
-                        battleRoom.players.push({
-                            id: socket.playerId,
-                            name: socket.userName,
-                            ready: false,
-                            nanovorSwarm: [],
-                            selectedNanovor: null,
-                            enemyTarget: null
-                        });
-
-                        // Update socket's active battle
-                        socket.activeBattle = battleName;
-
-                        // Send invitation response to the game creator
-                        const responseMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationResponse","battleName":"${battleName}","player":"${socket.userName}","inviterName":"${battleRoom.creatorName}","inviterId":"${battleRoom.creator}","otherPlayers":${JSON.stringify(battleRoom.players.filter(p => p.id !== socket.playerId && p.id !== battleRoom.creator).map(p => ({username: p.name, userRefId: p.id})))}}]]></body></msg>\x00`;
-
-                        sendMessageToUser(battleRoom.creator, responseMsg);
-
-                        // If we now have enough players, start the game
-                        if (battleRoom.players.length === battleRoom.maxPlayers) {
-                            battleRoom.gameState = 'in_progress';
-
-                            // Set up turn order and ensure default swarm for humans
-                            battleRoom.turnOrder = [...battleRoom.players];
-                            battleRoom.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(battleRoom, idx); });
-
-                            // Send game started message to all players (include selectedSwarmIds)
-                            const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${battleName}","players":${JSON.stringify(playersForClient(battleRoom))},"gameCreator":"${battleRoom.creatorName}"}]]></body></msg>\x00`;
-
-                            broadcastToBattle(battleName, gameStartMsg);
-                        }
-
-                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationResponse","battleName":"${battleName}","accepted":true}]]></body></msg>\x00`;
-                    } else {
-                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
+                const br = battleRooms[battleName];
+                if (br && br.players.length < br.maxPlayers) {
+                    br.players.push({ id: socket.playerId, name: socket.userName, ready: false, nanovorSwarm: [], selectedNanovor: null, enemyTarget: null });
+                    socket.activeBattle = battleName;
+                    sendMessageToUser(br.creator, _xt({
+                        _cmd: 'invitationResponse', battleName, player: socket.userName,
+                        inviterName: br.creatorName, inviterId: br.creator,
+                        otherPlayers: br.players.filter(p => p.id !== socket.playerId && p.id !== br.creator).map(p => ({ username: p.name, userRefId: p.id })),
+                    }));
+                    if (br.players.length === br.maxPlayers) {
+                        br.gameState = 'in_progress';
+                        br.turnOrder = [...br.players];
+                        br.players.forEach((p, idx) => ensureDefaultSwarmForPlayer(br, idx));
+                        broadcastToBattle(battleName, _xt({ _cmd: 'gameStarted', battleName, players: playersForClient(br), gameCreator: br.creatorName }));
                     }
+                    response = _xt({ _cmd: 'invitationResponse', battleName, accepted: true });
                 } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
+                    response = _xt({ _cmd: 'gameError' });
                 }
             } else {
-                // User declined the invitation
-                const battleRoom = battleRooms[battleName];
-                if (battleRoom) {
-                    // Send decline notification to the game creator
-                    const declineMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationResponse","battleName":"${battleName}","accepted":false,"player":"${socket.userName}","reason":"${replyReason}"}]]></body></msg>\x00`;
-
-                    sendMessageToUser(battleRoom.creator, declineMsg);
-                }
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"invitationResponse","battleName":"${battleName}","accepted":false,"reason":"${replyReason}"}]]></body></msg>\x00`;
+                const br = battleRooms[battleName];
+                if (br) sendMessageToUser(br.creator, _xt({ _cmd: 'invitationResponse', battleName, accepted: false, player: socket.userName, reason: replyReason }));
+                response = _xt({ _cmd: 'invitationResponse', battleName, accepted: false, reason: replyReason });
             }
             break;
+        }
 
-        case 'setGameSwarmValue':
-            // Set the game swarm value for the battle
-            const newSwarmValue = params.gameSwarmValue || 1000;
-            const currentBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (currentBattle && currentBattle.creator === socket.playerId) {
-                currentBattle.gameSwarmValue = newSwarmValue;
-
-                // Notify other players of the change
-                const swarmValueSetMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameSwarmValueSet","battleName":"${currentBattle.name}","gameSwarmValue":${newSwarmValue}}]]></body></msg>\x00`;
-
-                broadcastToBattle(currentBattle.name, swarmValueSetMsg, socket.playerId);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameSwarmValueSet","battleName":"${currentBattle.name}","gameSwarmValue":${newSwarmValue}}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'setSwarm':
-            console.log(`[GAMEXT_LOG] setSwarm command called by user ${socket.userId} (${socket.userName})`, params);
-            // Parse nanovor IDs: client may send nanovorIds, selectedSwarmIds, or swarmIds (string "1,24", array [1, 24], or array of objects [{id:1}])
-            const rawNanovorIds = params.nanovorIds ?? params.selectedSwarmIds ?? params.swarmIds;
+        case 'setSwarm': {
+            const rawIds = params.nanovorIds ?? params.selectedSwarmIds ?? params.swarmIds;
             let nanovorIds = [];
-            if (rawNanovorIds != null) {
-                if (Array.isArray(rawNanovorIds)) {
-                    nanovorIds = rawNanovorIds.map(item => (item && typeof item === 'object' && 'id' in item ? Number(item.id) : Number(item))).filter(n => !Number.isNaN(n));
+            if (rawIds != null) {
+                if (Array.isArray(rawIds)) {
+                    nanovorIds = rawIds.map(item => (item && typeof item === 'object' && 'id' in item ? Number(item.id) : Number(item))).filter(n => !isNaN(n));
                 } else {
-                    nanovorIds = String(rawNanovorIds).split(',').map(id => parseInt(id.trim(), 10)).filter(n => !Number.isNaN(n));
+                    nanovorIds = String(rawIds).split(',').map(id => parseInt(id.trim(), 10)).filter(n => !isNaN(n));
                 }
             }
-            const activeBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
+            const ab = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
+            if (!ab) { response = _xt({ _cmd: 'gameError' }); break; }
+            const pIdx = ab.players.findIndex(p => p.id === socket.playerId);
+            if (pIdx === -1) { response = _xt({ _cmd: 'gameError' }); break; }
 
-            if (activeBattle) {
-                const playerIndex = activeBattle.players.findIndex(p => p.id === socket.playerId);
-                if (playerIndex !== -1) {
-                    // Validate that the user actually owns these nanovor (match by numeric id)
-                    const user = users[socket.userId];
-                    if (user && user.nanovorInventory && user.nanovorInventory.length > 0) {
-                        const validNanovorIds = nanovorIds.filter(nanovorId =>
-                            user.nanovorInventory.some(nano => Number(nano.id) === Number(nanovorId))
-                        );
+            ab.players[pIdx].nanovorSwarm = nanovorIds;
+            const refStr = String(socket.playerId);
+            if (!ab.swarmIds) ab.swarmIds = {};
+            ab.swarmIds[refStr] = nanovorIds.map(String);
 
-                        // Check if the swarm size is within limits
-                        const gameSwarmValue = activeBattle.gameSwarmValue || 1000;
-                        let totalSwarmValue = 0;
-
-                        for (const nanovorId of validNanovorIds) {
-                            const nanovor = user.nanovorInventory.find(nano => nano.id === nanovorId);
-                            if (nanovor) {
-                                totalSwarmValue += nanovor.pv || 0; // Use point value from nanovor data
-                            }
-                        }
-
-                        // For NewUserState, we might want to allow a lower swarm value or different validation
-                        if (totalSwarmValue > gameSwarmValue && activeBattle.name.includes('newuser')) {
-                            // Allow some flexibility for new user experience
-                            console.log(`[GAMEXT_LOG] Allowing swarm value ${totalSwarmValue} for new user battle (limit: ${gameSwarmValue})`);
-                        } else if (totalSwarmValue > gameSwarmValue) {
-                            // Swarm exceeds the game limit
-                            console.log(`[GAMEXT_LOG] setSwarm rejected - swarm value ${totalSwarmValue} exceeds limit ${gameSwarmValue}`);
-                            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError","errorMessage":"Swarm value ${totalSwarmValue} exceeds limit ${gameSwarmValue}"}]]></body></msg>\x00`;
-                        } else {
-                            // Valid swarm, update the player's swarm
-                            activeBattle.players[playerIndex].nanovorSwarm = validNanovorIds;
-                            console.log(`[GAMEXT_LOG] setSwarm accepted - user ${socket.userId} set swarm with ${validNanovorIds.length} nanovors (value: ${totalSwarmValue})`);
-
-                            const setSwarmUserRefId = clientUserRefId(activeBattle, activeBattle.players[playerIndex]);
-                            const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${validNanovorIds.length},"swarmValue":${totalSwarmValue},"username":"${socket.userName}","userRefId":"${setSwarmUserRefId}","selectedSwarmIds":${JSON.stringify(validNanovorIds)}}]]></body></msg>\x00`;
-
-                            broadcastToBattle(activeBattle.name, swarmSelectedMsg, socket.playerId);
-
-                            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${validNanovorIds.length},"swarmValue":${totalSwarmValue},"username":"${socket.userName}","userRefId":"${setSwarmUserRefId}","selectedSwarmIds":${JSON.stringify(validNanovorIds)}}]]></body></msg>\x00`;
-                        }
-                    } else {
-                        // User doesn't have inventory data, use basic validation
-                        activeBattle.players[playerIndex].nanovorSwarm = nanovorIds;
-                        console.log(`[GAMEXT_LOG] setSwarm accepted (no inventory validation) - user ${socket.userId} set swarm with ${nanovorIds.length} nanovors`);
-
-                        const setSwarmUserRefId = clientUserRefId(activeBattle, activeBattle.players[playerIndex]);
-                        const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${nanovorIds.length},"username":"${socket.userName}","userRefId":"${setSwarmUserRefId}","selectedSwarmIds":${JSON.stringify(nanovorIds)}}]]></body></msg>\x00`;
-
-                        broadcastToBattle(activeBattle.name, swarmSelectedMsg, socket.playerId);
-
-                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${nanovorIds.length},"username":"${socket.userName}","userRefId":"${setSwarmUserRefId}","selectedSwarmIds":${JSON.stringify(nanovorIds)}}]]></body></msg>\x00`;
-                    }
-                } else {
-                    console.log(`[GAMEXT_LOG] setSwarm failed - user ${socket.userId} not found in battle ${socket.activeBattle}`);
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-                }
-            } else {
-                console.log(`[GAMEXT_LOG] setSwarm failed - no active battle for user ${socket.userId}`);
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'setSelectedNanovor':
-            // Set the selected nanovor for the player
-            const selectedNanovorId = params.nanovorId || 0;
-            const selectedBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (selectedBattle) {
-                const playerIndex = selectedBattle.players.findIndex(p => p.id === socket.playerId);
-                if (playerIndex !== -1) {
-                    selectedBattle.players[playerIndex].selectedNanovor = selectedNanovorId;
-
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"selectedNanovorSet","nanovorId":${selectedNanovorId}}]]></body></msg>\x00`;
-                } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-                }
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'setEnemy':
-            // Set the target enemy for attack
-            const enemyUsername = params.enemyUsername;
-            const enemyBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (enemyBattle) {
-                const playerIndex = enemyBattle.players.findIndex(p => p.id === socket.playerId);
-                if (playerIndex !== -1) {
-                    // Find the target player by username
-                    const targetIndex = enemyBattle.players.findIndex(p => p.name === enemyUsername);
-                    if (targetIndex !== -1) {
-                        enemyBattle.players[playerIndex].enemyTarget = enemyBattle.players[targetIndex].id;
-
-                        // Send target selected notification to all players
-                        const targetSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"targetSelected","userRefId":"${socket.playerId}","targetUserRefId":"${enemyBattle.players[targetIndex].id}","attackId":0}]]></body></msg>\x00`;
-
-                        broadcastToBattle(enemyBattle.name, targetSelectedMsg);
-
-                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"enemyTargetSet","targetUsername":"${enemyUsername}","targetId":"${enemyBattle.players[targetIndex].id}"}]]></body></msg>\x00`;
-                    } else {
-                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-                    }
-                } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-                }
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'setAttackInfo':
-            // Set complete attack information
-            const targetPlayerName = params.enemyUsername;
-            const myNanovorId = params.nanovorId;
-            const setAttackId = params.attackId;
-            const swapNanovorId = params.swapNanovorId;
-            const attackBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (attackBattle) {
-                const playerIndex = attackBattle.players.findIndex(p => p.id === socket.playerId);
-                if (playerIndex !== -1) {
-                    // Find the target player
-                    const targetIndex = attackBattle.players.findIndex(p => p.name === targetPlayerName);
-                    if (targetIndex !== -1) {
-                        // Record the attack info
-                        const attackInfo = {
-                            attackerId: socket.playerId,
-                            targetId: attackBattle.players[targetIndex].id,
-                            nanovorId: myNanovorId,
-                            attackId: setAttackId,
-                            swapNanovorId: swapNanovorId,
-                            timestamp: Date.now()
+            if (!ab.teamState) ab.teamState = {};
+            ab.teamState[refStr] = {};
+            const u = users[socket.userId];
+            for (const aid of nanovorIds) {
+                const nid = String(aid);
+                if (u && u.nanovorInventory) {
+                    const inv = u.nanovorInventory.find(n => String(n.id) === nid);
+                    if (inv) {
+                        const v = virmonData.getVirmon ? virmonData.getVirmon(inv.asset_type_id || inv.assetTypeId) : null;
+                        ab.teamState[refStr][nid] = {
+                            instanceId: nid,
+                            assetTypeId: parseInt(inv.asset_type_id || inv.assetTypeId || 1, 10),
+                            nickname: String(inv.nickname || ''),
+                            speed: parseInt(v ? v.speed : (inv.speed || 10), 10),
+                            strength: parseInt(v ? v.strength : (inv.strength || 100), 10),
+                            armor: parseInt(v ? v.armor : (inv.armor || 0), 10),
+                            health: parseInt(v ? v.health : (inv.health || 100), 10),
                         };
+                    }
+                }
+            }
 
-                        attackBattle.battleHistory.push(attackInfo);
+            const uriId = clientUserRefId(ab, ab.players[pIdx]);
+            const swarmPayload = {
+                _cmd: 'swarmSelected',
+                battleName: ab.name,
+                swarmCount: nanovorIds.length,
+                swarmValue: params.swarmValue || 0,
+                username: socket.userName,
+                userRefId: uriId,
+                selectedSwarmIds: nanovorIds,
+            };
+            broadcastToBattle(ab.name, _xt(swarmPayload), socket.playerId);
+            response = _xt(swarmPayload);
 
-                        // Send attack performed notification to all players
-                        const attackMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"performAttack","attackResults":{"attackerId":"${socket.playerId}","targetId":"${attackBattle.players[targetIndex].id}","nanovorId":${myNanovorId},"attackId":${setAttackId}}}]]></body></msg>\x00`;
+            if (!ab.swarmSelected) ab.swarmSelected = new Set();
+            ab.swarmSelected.add(socket.playerId);
+            const allSelected = ab.swarmSelected.size >= ab.players.length;
+            if (allSelected && !ab.readyForTurnSent) {
+                ab.readyForTurnSent = true;
+                ab.gameState = 'in_combat';
+                ab.attackChoices = {};
+                const readyPayload = { _cmd: 'readyForTurn', nanovorId: 0, isDead: false };
+                const sockets = _battleSockets(ab.name);
+                for (const s of sockets) _sendTo(s, readyPayload);
+                if (!sockets.some(s => s === socket)) _sendTo(socket, readyPayload);
+            }
+            break;
+        }
 
-                        broadcastToBattle(attackBattle.name, attackMsg);
+        case 'setAttackInfo': {
+            const attackId = params.attackId || 0;
+            _sendTo(socket, { _cmd: 'attackInfoSet', attackId });
 
-                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"attackInfoSet","attackId":${setAttackId}}]]></body></msg>\x00`;
-                    } else {
-                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
+            const battleName = socket.activeBattle;
+            if (!battleName || !battleRooms[battleName]) break;
+            const b = battleRooms[battleName];
+            if (b.gameState !== 'in_combat') break;
+
+            if (!b.attackChoices) b.attackChoices = {};
+            const uid = String(socket.playerId);
+            b.attackChoices[uid] = {
+                attackId,
+                nanovorId: params.nanovorId || '0',
+                enemyUsername: params.enemyUsername || '',
+                swapNanovorId: params.swapNanovorId || '0',
+            };
+
+            const numPlayers = (b.players || []).length;
+            if (Object.keys(b.attackChoices).length >= numPlayers) {
+                if (!b.roundInfoPayload) {
+                    if (_buildRoundInfoFromAttackChoices(b)) {
+                        setTimeout(() => {
+                            const payload = b.roundInfoPayload;
+                            const players = (payload || {}).players || [];
+                            const minimal = _minimalSetRoundInfoPlayers(players);
+                            const orderedUids = _computeTurnOrderUids(minimal);
+                            b.turn_order_uids = orderedUids;
+                            const ordered = _orderPlayersByTurnOrder(minimal, orderedUids);
+                            const roundNum = b.round || 1;
+                            const sockets = _battleSockets(battleName);
+                            for (const s of sockets) _sendTo(s, { _cmd: 'setRoundInfo', players: ordered, round: roundNum });
+                            _resolveRoundAttacks(battleName);
+                        }, SET_ROUND_INFO_DELAY_MS);
                     }
                 } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
+                    _resolveRoundAttacks(battleName);
                 }
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
             }
             break;
+        }
 
-        case 'endRound':
-            // End the current round
-            const roundBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
+        case 'endRound': {
+            const battleName = socket.activeBattle;
+            if (!battleName || !battleRooms[battleName]) {
+                response = _xt({ _cmd: 'gameError' });
+                break;
+            }
+            const b = battleRooms[battleName];
+            b.round = (b.round || 1) + 1;
 
-            if (roundBattle) {
-                // Increment round number
-                roundBattle.round++;
+            if (!b.endRoundReceived) b.endRoundReceived = new Set();
+            b.endRoundReceived.add(String(socket.playerId));
+            _sendTo(socket, { _cmd: 'roundEnded', round: b.round });
 
-                // Reset turn counter for the new round
-                roundBattle.currentTurn = 0;
+            const numPlayers = (b.players || []).length;
+            if (b.endRoundReceived.size >= numPlayers) {
+                b.endRoundReceived = new Set();
+                const sockets = _battleSockets(battleName);
 
-                // Send round completed notification to all players
-                const roundCompleteMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"roundCompleted","round":${roundBattle.round}}]]></body></msg>\x00`;
-
-                broadcastToBattle(roundBattle.name, roundCompleteMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"roundEnded","round":${roundBattle.round}}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
+                const gameOverPayload = b.gameOver;
+                if (gameOverPayload) {
+                    delete b.gameOver;
+                    const goMsg = { _cmd: 'gameOver', winnerId: gameOverPayload.winnerId, results: gameOverPayload.results };
+                    for (const s of sockets) _sendTo(s, goMsg);
+                    for (const s of sockets) s.activeBattle = null;
+                    delete battleRooms[battleName];
+                    for (const [key, val] of Object.entries(_quickBattleQueue)) {
+                        if (val === battleName) { delete _quickBattleQueue[key]; break; }
+                    }
+                } else {
+                    if (b.sendSetRoundInfoBeforeNextResolve) {
+                        b.sendSetRoundInfoBeforeNextResolve = false;
+                        const readyPayload = { _cmd: 'readyForTurn', nanovorId: 0, isDead: false };
+                        for (const s of sockets) _sendTo(s, readyPayload);
+                    } else {
+                        const roundState = b.roundState || {};
+                        const minimalRoundPlayers = [];
+                        for (const pp of (b.roundInfoPayload || {}).players || []) {
+                            const ref = parseInt(pp.userRefId || 0, 10);
+                            const st = roundState[String(ref)] || {};
+                            minimalRoundPlayers.push({ userRefId: ref, selectedNanovor: Object.assign({}, st) });
+                        }
+                        const minimal = _minimalSetRoundInfoPlayers(minimalRoundPlayers);
+                        const orderedUids = _computeTurnOrderUids(minimal);
+                        b.turn_order_uids = orderedUids;
+                        const ordered = _orderPlayersByTurnOrder(minimal, orderedUids);
+                        const roundNum = b.round || 1;
+                        for (const s of sockets) _sendTo(s, { _cmd: 'setRoundInfo', players: ordered, round: roundNum });
+                        const readyPayload = { _cmd: 'readyForTurn', nanovorId: 0, isDead: false };
+                        for (const s of sockets) _sendTo(s, readyPayload);
+                    }
+                }
             }
             break;
+        }
 
-        case 'quitGame':
-            console.log(`[GAMEXT_LOG] quitGame command called by user ${socket.userId} (${socket.userName})`, params);
-            // Quit the current game
-            const quittingUserId = params.userRefId;
+        case 'quitGame': {
+            const quittingUserId = params.userRefId || socket.playerId;
             const quitBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
             if (quitBattle) {
-                // Remove player from the battle
+                const quitterName = socket.userName || 'Unknown';
                 quitBattle.players = quitBattle.players.filter(p => p.id !== quittingUserId);
-                console.log(`[GAMEXT_LOG] quitGame - user ${quittingUserId} removed from battle ${quitBattle.name}, ${quitBattle.players.length} players remaining`);
-
-                // If there's only one player left, end the game
                 if (quitBattle.players.length <= 1) {
                     quitBattle.gameState = 'finished';
-                    console.log(`[GAMEXT_LOG] quitGame - only ${quitBattle.players.length} player left, ending game`);
-
-                    // Notify remaining players that the game is over
-                    const gameOverMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameOver","winnerId":"${quitBattle.players[0]?.id || ''}","results":"Game ended due to player quit"}]]></body></msg>\x00`;
-
-                    broadcastToBattle(quitBattle.name, gameOverMsg);
+                    broadcastToBattle(quitBattle.name, _xt({ _cmd: 'gameOver', winnerId: quitBattle.players[0]?.id || '', results: 'Game ended due to player quit' }));
+                    if (quitBattle.players[0] && users[quitBattle.players[0].id]) {
+                        users[quitBattle.players[0].id].nanocash = (users[quitBattle.players[0].id].nanocash || 0) + 50;
+                        saveUserData(quitBattle.players[0].id);
+                    }
+                    delete battleRooms[quitBattle.name];
                 } else {
-                    // Notify other players that someone quit
-                    const playerQuitMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerQuitGame","userRefId":"${quittingUserId}","username":"${users[quittingUserId]?.username || 'Unknown'}"}]]></body></msg>\x00`;
-                    console.log(`[GAMEXT_LOG] quitGame - notifying other players about user ${quittingUserId} quitting`);
-
-                    broadcastToBattle(quitBattle.name, playerQuitMsg);
+                    broadcastToBattle(quitBattle.name, _xt({ _cmd: 'playerQuitGame', userRefId: quittingUserId, username: quitterName }));
                 }
-
-                // Clear the active battle for the socket
                 socket.activeBattle = null;
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"quitGameConfirmed","userRefId":"${quittingUserId}"}]]></body></msg>\x00`;
-                console.log(`[GAMEXT_LOG] quitGame completed for user ${quittingUserId}`);
+                response = _xt({ _cmd: 'quitGameConfirmed', userRefId: quittingUserId });
             } else {
-                console.log(`[GAMEXT_LOG] quitGame failed - no active battle for user ${socket.userId}`);
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
+                response = _xt({ _cmd: 'gameError' });
             }
             break;
+        }
 
-        case 'cancelQuickBattle':
-            // Cancel matchmaking
-            const cancelUserId = params.userRefId;
-            const cancelBattleName = Object.keys(battleRooms).find(battleName => {
-                const battle = battleRooms[battleName];
-                return battle.creator === cancelUserId && battle.gameState === 'waiting_for_players';
+        case 'gameQuit': {
+            const quitBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
+            if (quitBattle) {
+                quitBattle.players = quitBattle.players.filter(p => p.id !== socket.playerId);
+                if (quitBattle.players.length <= 1) {
+                    quitBattle.gameState = 'finished';
+                    broadcastToBattle(quitBattle.name, _xt({ _cmd: 'gameOver', winnerId: quitBattle.players[0]?.id || '', results: 'Game ended due to player quit' }));
+                    if (quitBattle.players[0] && users[quitBattle.players[0].id]) {
+                        users[quitBattle.players[0].id].nanocash = (users[quitBattle.players[0].id].nanocash || 0) + 50;
+                        saveUserData(quitBattle.players[0].id);
+                    }
+                    delete battleRooms[quitBattle.name];
+                } else {
+                    broadcastToBattle(quitBattle.name, _xt({ _cmd: 'playerQuitGame', userRefId: socket.playerId, username: socket.userName || 'Unknown' }));
+                }
+                socket.activeBattle = null;
+                response = _xt({ _cmd: 'gameQuitConfirmed', userRefId: socket.playerId });
+            } else {
+                response = _xt({ _cmd: 'gameError' });
+            }
+            break;
+        }
+
+        case 'cancelQuickBattle': {
+            const cancelUserId = params.userRefId || socket.playerId;
+            const cancelBattleName = Object.keys(battleRooms).find(bn => {
+                return battleRooms[bn].creator === cancelUserId && battleRooms[bn].gameState === 'waiting_for_players';
             });
-
             if (cancelBattleName) {
-                // Notify other players in the battle that it's cancelled
-                const cancelMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameOver","results":"Game was cancelled by the creator"}]]></body></msg>\x00`;
-
-                broadcastToBattle(cancelBattleName, cancelMsg);
-
+                broadcastToBattle(cancelBattleName, _xt({ _cmd: 'gameOver', results: 'Game was cancelled' }));
                 delete battleRooms[cancelBattleName];
-
-                // Clear the active battle for the socket
+                for (const [key, val] of Object.entries(_quickBattleQueue)) {
+                    if (val === cancelBattleName) { delete _quickBattleQueue[key]; break; }
+                }
                 socket.activeBattle = null;
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"quickBattleCancelled"}]]></body></msg>\x00`;
+                response = _xt({ _cmd: 'quickBattleCancelled' });
             } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
+                response = _xt({ _cmd: 'gameError' });
             }
             break;
+        }
 
-        case 'getBadgeList':
-            // Get badge list for a player
-            const ownerId = params.ownerId;
-            const nanovorId = params.nanovorId;
-
-            // Return empty badge list for now
-            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"badgeList","ownerId":"${ownerId}","nanovorId":"${nanovorId}","badges":[]}]]></body></msg>\x00`;
+        case 'getBadgeList': {
+            response = _xt({ _cmd: 'badgeList', ownerId: params.ownerId || '', nanovorId: params.nanovorId || '', badges: [] });
             break;
+        }
 
-        case 'startGame':
-            console.log(`[GAMEXT_LOG] startGame command called by user ${socket.userId} (${socket.userName})`, params);
-            // Start the game manually (when all players are ready)
+        case 'setReady': {
+            const readyBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
+            if (readyBattle) {
+                const pIdx = readyBattle.players.findIndex(p => p.id === socket.playerId);
+                if (pIdx !== -1) {
+                    readyBattle.players[pIdx].ready = true;
+                    const allReady = readyBattle.players.every(p => p.ready);
+                    if (allReady && readyBattle.players.length >= 2) {
+                        readyBattle.gameState = 'in_progress';
+                        readyBattle.turnOrder = [...readyBattle.players];
+                        readyBattle.players.forEach((p, idx) => ensureDefaultSwarmForPlayer(readyBattle, idx));
+                        const senseiPayload = isSenseiBattle(readyBattle) ? { isSenseiBattle: true } : {};
+                        broadcastToBattle(readyBattle.name, _xt(Object.assign({
+                            _cmd: 'gameStarted', battleName: readyBattle.name,
+                            players: playersForClient(readyBattle), gameCreator: readyBattle.creatorName,
+                        }, senseiPayload)));
+                    }
+                    response = _xt({ _cmd: 'playerReady', userRefId: socket.playerId, ready: true });
+                } else {
+                    response = _xt({ _cmd: 'gameError' });
+                }
+            } else {
+                response = _xt({ _cmd: 'gameError' });
+            }
+            break;
+        }
+
+        case 'startGame': {
             const startBattleName = params.battleName;
             const startBattle = battleRooms[startBattleName];
-
             if (startBattle) {
                 startBattle.gameState = 'in_progress';
-                console.log(`[GAMEXT_LOG] startGame - starting game in battle ${startBattleName}, ${startBattle.players.length} players`);
-
-                // Set up turn order
                 startBattle.turnOrder = [...startBattle.players];
-                startBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(startBattle, idx); });
-
-                // Send game started message to all players (include selectedSwarmIds so client can show nanovors)
-                const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startBattleName}","players":${JSON.stringify(playersForClient(startBattle))},"gameCreator":"${startBattle.creatorName}"}]]></body></msg>\x00`;
-
-                broadcastToBattle(startBattleName, gameStartMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startBattleName}"}]]></body></msg>\x00`;
-                console.log(`[GAMEXT_LOG] startGame completed for battle ${startBattleName}`);
-            } else {
-                console.log(`[GAMEXT_LOG] startGame failed - battle ${startBattleName} not found`);
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'setAttack':
-            // Set attack to perform
-            const attackToSet = params.attackId || 0;
-
-            // In a real implementation, this would record the player's chosen attack
-            // For now, just acknowledge the command
-            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"attackSet","attackId":${attackToSet}}]]></body></msg>\x00`;
-            break;
-
-        case 'setNextSwap':
-            // Set next nanovor to swap to
-            const nextNanovorId = params.nanovorId || 0;
-            const swapBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (swapBattle) {
-                const playerIndex = swapBattle.players.findIndex(p => p.id === socket.playerId);
-                if (playerIndex !== -1) {
-                    // Record the swap intention
-                    swapBattle.players[playerIndex].nextSwap = nextNanovorId;
-
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"nextSwapSet","nanovorId":${nextNanovorId}}]]></body></msg>\x00`;
-                } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-                }
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'declinedToWatch':
-            // Player declined to watch an ongoing battle
-            const declinerId = params.userRefId;
-
-            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"declinedToWatchConfirmed","userRefId":"${declinerId}"}]]></body></msg>\x00`;
-            break;
-
-        case 'kickPlayerOut':
-            // Kick a player from the battle
-            const usernameToKick = params.username;
-            const kickBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (kickBattle && kickBattle.creator === socket.playerId) {
-                // Find and remove the player
-                const playerToKickIndex = kickBattle.players.findIndex(p => p.name === usernameToKick);
-                if (playerToKickIndex !== -1) {
-                    const kickedPlayer = kickBattle.players[playerToKickIndex];
-
-                    // Send kick notification to the kicked player
-                    const kickMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerKickedOut","userRefId":"${kickedPlayer.id}"}]]></body></msg>\x00`;
-
-                    sendMessageToUser(kickedPlayer.id, kickMsg);
-
-                    // Remove the player from the battle
-                    kickBattle.players.splice(playerToKickIndex, 1);
-
-                    // If there's only one player left, end the game
-                    if (kickBattle.players.length <= 1) {
-                        kickBattle.gameState = 'finished';
-
-                        // Notify remaining players that the game is over
-                        const gameOverMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameOver","winnerId":"${kickBattle.players[0]?.id || ''}","results":"Game ended due to player kick"}]]></body></msg>\x00`;
-
-                        broadcastToBattle(kickBattle.name, gameOverMsg);
-                    } else {
-                        // Notify other players that someone was kicked
-                        const playerKickedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerQuitGame","userRefId":"${kickedPlayer.id}","username":"${kickedPlayer.name}"}]]></body></msg>\x00`;
-
-                        broadcastToBattle(kickBattle.name, playerKickedMsg);
-                    }
-
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerKickedOut","userRefId":"${kickedPlayer.id}"}]]></body></msg>\x00`;
-                } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-                }
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'setReady':
-            console.log(`[GAMEXT_LOG] setReady command called by user ${socket.userId} (${socket.userName})`, params);
-            // Set player ready state
-            const readyBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (readyBattle) {
-                const playerIndex = readyBattle.players.findIndex(p => p.id === socket.playerId);
-                if (playerIndex !== -1) {
-                    readyBattle.players[playerIndex].ready = true;
-                    console.log(`[GAMEXT_LOG] setReady - user ${socket.userId} marked as ready in battle ${readyBattle.name}`);
-
-                    // Check if all players are ready
-                    const allReady = readyBattle.players.every(p => p.ready);
-
-                    if (allReady && readyBattle.players.length >= 2) {
-                        // Start the game if all players are ready
-                        readyBattle.gameState = 'in_progress';
-                        console.log(`[GAMEXT_LOG] setReady - all players ready, starting game in battle ${readyBattle.name}`);
-
-                        // Set up turn order and ensure human players have default swarm if empty
-                        readyBattle.turnOrder = [...readyBattle.players];
-                        readyBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(readyBattle, idx); });
-
-                        // Send game started message to all players (include selectedSwarmIds)
-                        const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${readyBattle.name}","players":${JSON.stringify(playersForClient(readyBattle))},"gameCreator":"${readyBattle.creatorName}"}]]></body></msg>\x00`;
-
-                        broadcastToBattle(readyBattle.name, gameStartMsg);
-                    }
-
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerReady","userRefId":"${socket.playerId}","ready":true}]]></body></msg>\x00`;
-                } else {
-                    console.log(`[GAMEXT_LOG] setReady failed - user ${socket.userId} not found in battle ${socket.activeBattle}`);
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-                }
-            } else {
-                console.log(`[GAMEXT_LOG] setReady failed - no active battle for user ${socket.userId}`);
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'getPlayerStatus':
-            // Get status of players in battle
-            const statusBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (statusBattle) {
-                const playerStatus = statusBattle.players.map(p => ({
-                    userRefId: clientUserRefId(statusBattle, p),
-                    username: p.name,
-                    ready: p.ready,
-                    nanovorSwarmSize: p.nanovorSwarm ? p.nanovorSwarm.length : 0,
-                    selectedSwarmIds: Array.isArray(p.nanovorSwarm) ? p.nanovorSwarm : []
+                startBattle.players.forEach((p, idx) => ensureDefaultSwarmForPlayer(startBattle, idx));
+                broadcastToBattle(startBattleName, _xt({
+                    _cmd: 'gameStarted', battleName: startBattleName,
+                    players: playersForClient(startBattle), gameCreator: startBattle.creatorName,
                 }));
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerStatusList","players":${JSON.stringify(playerStatus)}}]}</body></msg>\x00`;
+                response = _xt({ _cmd: 'gameStarted', battleName: startBattleName });
             } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
+                response = _xt({ _cmd: 'gameError' });
             }
             break;
+        }
 
-        case 'getBattleStatus':
-            // Get current battle state
-            const battleStatus = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (battleStatus) {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"battleStatus","battleName":"${battleStatus.name}","gameState":"${battleStatus.gameState}","currentRound":${battleStatus.round},"playerCount":${battleStatus.players.length}}]}</body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'performAttack':
-            console.log(`[GAMEXT_LOG] performAttack command called by user ${socket.userId} (${socket.userName})`, params);
-            // Perform an attack action
-            const targetUserRefId = params.targetUserRefId;
-            const attackNanovorId = params.nanovorId;
-            const attackId = params.attackId;
-            const performAttackBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (performAttackBattle) {
-                // Record the attack in battle history
-                const attackRecord = {
-                    attackerId: socket.playerId,
-                    targetId: targetUserRefId,
-                    nanovorId: attackNanovorId,
-                    attackId: attackId,
-                    timestamp: Date.now()
-                };
-
-                performAttackBattle.battleHistory.push(attackRecord);
-                console.log(`[GAMEXT_LOG] performAttack recorded - ${socket.userId} attacked ${targetUserRefId} with nanovor ${attackNanovorId}, attackId: ${attackId}`);
-
-                // Send attack notification to all players
-                const attackMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"performAttack","attackResults":{"attackerId":"${socket.playerId}","targetId":"${targetUserRefId}","nanovorId":${attackNanovorId},"attackId":${attackId}}}]]></body></msg>\x00`;
-
-                broadcastToBattle(performAttackBattle.name, attackMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"attackPerformed","attackId":${attackId}}]]></body></msg>\x00`;
-                console.log(`[GAMEXT_LOG] performAttack completed successfully`);
-            } else {
-                console.log(`[GAMEXT_LOG] performAttack failed - no active battle for user ${socket.userId}`);
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'swapNanovor':
-            // Swap active nanovor during battle
-            const newNanovorId = params.newNanovorId;
-            const swapNanovorBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (swapNanovorBattle) {
-                const playerIndex = swapNanovorBattle.players.findIndex(p => p.id === socket.playerId);
-                if (playerIndex !== -1) {
-                    // Update the selected nanovor
-                    swapNanovorBattle.players[playerIndex].selectedNanovor = newNanovorId;
-
-                    // Notify all players about the swap
-                    const swapMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swapNanovor","userRefId":"${socket.playerId}","newNanovorId":${newNanovorId}}]]></body></msg>\x00`;
-
-                    broadcastToBattle(swapNanovorBattle.name, swapMsg);
-
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"nanovorSwapped","newNanovorId":${newNanovorId}}]]></body></msg>\x00`;
-                } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-                }
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'killNanovor':
-            // Mark a nanovor as defeated
-            const killedNanovorId = params.nanovorId;
-            const killerId = params.killerId;
-            const killBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (killBattle) {
-                // Notify all players about the nanovor death
-                const killMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"killNanovor","nanovorId":${killedNanovorId},"killerId":"${killerId}"}]]></body></msg>\x00`;
-
-                broadcastToBattle(killBattle.name, killMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"nanovorKilled","nanovorId":${killedNanovorId}}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'blockSwap':
-            // Block nanovor swapping
-            const blockerId = params.blockerId;
-            const blockBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (blockBattle) {
-                // Notify all players about the swap block
-                const blockMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"blockSwap","blockerId":"${blockerId}"}]]></body></msg>\x00`;
-
-                broadcastToBattle(blockBattle.name, blockMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swapBlocked","blockerId":"${blockerId}"}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'selectNanovor':
-            // Select a nanovor for battle
-            const selectNanovorId = params.nanovorId;
-            const selectBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (selectBattle) {
-                const playerIndex = selectBattle.players.findIndex(p => p.id === socket.playerId);
-                if (playerIndex !== -1) {
-                    selectBattle.players[playerIndex].selectedNanovor = selectNanovorId;
-
-                    // Notify all players about the selection
-                    const selectMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"selectNanovor","userRefId":"${socket.playerId}","nanovorId":${selectNanovorId}}]]></body></msg>\x00`;
-
-                    broadcastToBattle(selectBattle.name, selectMsg);
-
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"nanovorSelected","nanovorId":${selectNanovorId}}]]></body></msg>\x00`;
-                } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-                }
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'setRoundInfo':
-            // Set round information. Client RoundInfo constructor expects param1.players (not param1.roundInfo.players).
-            const roundInfo = params.roundInfo;
-            const roundInfoBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (roundInfoBattle) {
-                // Update round info in battle
-                roundInfoBattle.currentRoundInfo = roundInfo;
-
-                // Client expects { _cmd, players, roundCounter } at top level so RoundInfo(param1) sees param1.players
-                const setRoundPayload = Object.assign({ _cmd: 'setRoundInfo' }, roundInfo);
-                const roundInfoMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[${JSON.stringify(setRoundPayload)}]]></body></msg>\x00`;
-
-                broadcastToBattle(roundInfoBattle.name, roundInfoMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"roundInfoSet","round":${roundInfoBattle.round}}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'showGameResults':
-            // Show game results
-            const gameResults = params.results;
-            const resultsBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (resultsBattle) {
-                // Notify all players about the game results
-                const resultsMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"showGameResults","results":${JSON.stringify(gameResults)}}]}</body></msg>\x00`;
-
-                broadcastToBattle(resultsBattle.name, resultsMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameResultsShown","battleName":"${resultsBattle.name}"}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'gameQuit':
-            console.log(`[GAMEXT_LOG] gameQuit command called by user ${socket.userId} (${socket.userName})`, params);
-            // Quit the game
-            const gameQuitBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (gameQuitBattle) {
-                // Remove player from the battle
-                gameQuitBattle.players = gameQuitBattle.players.filter(p => p.id !== socket.playerId);
-                console.log(`[GAMEXT_LOG] gameQuit - user ${socket.userId} removed from battle ${gameQuitBattle.name}, ${gameQuitBattle.players.length} players remaining`);
-
-                // If there's only one player left, end the game
-                if (gameQuitBattle.players.length <= 1) {
-                    gameQuitBattle.gameState = 'finished';
-                    console.log(`[GAMEXT_LOG] gameQuit - only ${gameQuitBattle.players.length} player left, ending game`);
-
-                    // Notify remaining players that the game is over
-                    const gameOverMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameOver","winnerId":"${gameQuitBattle.players[0]?.id || ''}","results":"Game ended due to player quit"}]]></body></msg>\x00`;
-
-                    broadcastToBattle(gameQuitBattle.name, gameOverMsg);
-                } else {
-                    // Notify other players that someone quit
-                    const playerQuitMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerQuitGame","userRefId":"${socket.playerId}","username":"${users[socket.userId]?.username || 'Unknown'}"}]]></body></msg>\x00`;
-                    console.log(`[GAMEXT_LOG] gameQuit - notifying other players about user ${socket.userId} quitting`);
-
-                    broadcastToBattle(gameQuitBattle.name, playerQuitMsg);
-                }
-
-                // Clear the active battle for the socket
-                socket.activeBattle = null;
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameQuitConfirmed","userRefId":"${socket.playerId}"}]]></body></msg>\x00`;
-                console.log(`[GAMEXT_LOG] gameQuit completed for user ${socket.userId}`);
-            } else {
-                console.log(`[GAMEXT_LOG] gameQuit failed - no active battle for user ${socket.userId}`);
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'playerJoinAutoBattle':
-            // Join an auto battle (sensei/tutorial: Training = -5, human = 0 in client payload)
+        case 'playerJoinAutoBattle': {
             const autoBattleName = params.battleName;
             const gameCreator = params.gameCreator;
             let gameCreatorId = params.gameCreatorId;
-            if (gameCreatorId === undefined || gameCreatorId === null) {
+            if (gameCreatorId == null) {
                 if (autoBattleName === 'Training') gameCreatorId = '-5';
                 else if (autoBattleName === 'Medium') gameCreatorId = '-4';
                 else if (autoBattleName === 'Easy') gameCreatorId = '-3';
@@ -910,352 +1398,119 @@ function handleGameXtCommand(socket, command, params) {
             }
             gameCreatorId = String(gameCreatorId);
 
-            // Create or join the auto battle
             if (!battleRooms[autoBattleName]) {
                 battleRooms[autoBattleName] = {
                     id: state.battleIdCounter++,
                     name: autoBattleName,
-                    gameSwarmValue: 1000, // Default value
+                    gameSwarmValue: 1000,
                     maxPlayers: 2,
-                    players: [{
-                        id: gameCreatorId,
-                        name: gameCreator || autoBattleName,
-                        ready: true,
-                        nanovorSwarm: [],
-                        selectedNanovor: null,
-                        enemyTarget: null
-                    }, {
-                        id: socket.playerId,
-                        name: socket.userName,
-                        ready: true,
-                        nanovorSwarm: [],
-                        selectedNanovor: null,
-                        enemyTarget: null
-                    }],
+                    players: [
+                        { id: gameCreatorId, name: gameCreator || autoBattleName, ready: true, nanovorSwarm: [], selectedNanovor: null, enemyTarget: null },
+                        { id: socket.playerId, name: socket.userName, ready: true, nanovorSwarm: [], selectedNanovor: null, enemyTarget: null },
+                    ],
                     creator: gameCreatorId,
                     creatorName: gameCreator || autoBattleName,
                     gameState: 'in_progress',
                     turnOrder: [],
                     currentTurn: 0,
                     round: 1,
-                    battleHistory: []
+                    battleHistory: [],
                 };
             } else {
-                // Add player to existing auto battle if there's space
-                const existingAutoBattle = battleRooms[autoBattleName];
-                if (existingAutoBattle.players.length < existingAutoBattle.maxPlayers) {
-                    existingAutoBattle.players.push({
-                        id: socket.playerId,
-                        name: socket.userName,
-                        ready: true,
-                        nanovorSwarm: [],
-                        selectedNanovor: null,
-                        enemyTarget: null
-                    });
+                const existing = battleRooms[autoBattleName];
+                if (existing.players.length < existing.maxPlayers) {
+                    existing.players.push({ id: socket.playerId, name: socket.userName, ready: true, nanovorSwarm: [], selectedNanovor: null, enemyTarget: null });
                 }
             }
-
-            // Update socket's active battle
             socket.activeBattle = autoBattleName;
 
-            // Set up turn order and start the game; ensure human players have default swarm
-            const finalAutoBattle = battleRooms[autoBattleName];
-            finalAutoBattle.turnOrder = [...finalAutoBattle.players];
-            finalAutoBattle.gameState = 'in_progress';
-            finalAutoBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(finalAutoBattle, idx); });
+            const fab = battleRooms[autoBattleName];
+            fab.turnOrder = [...fab.players];
+            fab.gameState = 'in_progress';
+            fab.players.forEach((p, idx) => ensureDefaultSwarmForPlayer(fab, idx));
 
-            const senseiBattle = isSenseiBattle(finalAutoBattle);
-            const senseiPayload = senseiBattle ? ',"isSenseiBattle":true' : '';
-            const playersJson = JSON.stringify(playersForClient(finalAutoBattle));
+            const isSensei = isSenseiBattle(fab);
+            const senseiP = isSensei ? { isSenseiBattle: true } : {};
+            const pJson = playersForClient(fab);
 
-            // Client expects playerJoinAutoBattle BEFORE gameStarted: battleStarted() uses _battleName and _gameCreator set by playerJoinAutoBattle(). Send in that order.
-            const humanPlayer = finalAutoBattle.players.find(p => p.id === socket.playerId);
-            const joinUserRefId = humanPlayer ? clientUserRefId(finalAutoBattle, humanPlayer) : String(socket.playerId);
-            const joinAutoMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerJoinAutoBattle","battleName":"${autoBattleName}","username":"${socket.userName}","userRefId":"${joinUserRefId}","gameCreator":"${gameCreator}","gameCreatorId":"${gameCreatorId}"${senseiPayload}}]]></body></msg>\x00`;
-            broadcastToBattle(autoBattleName, joinAutoMsg);
+            const hp = fab.players.find(p => p.id === socket.playerId);
+            const joinRefId = hp ? clientUserRefId(fab, hp) : String(socket.playerId);
 
-            console.log(`[GAMEXT_LOG] gameStarted players (joinUserRefId=${joinUserRefId}):`, playersJson);
-            const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${autoBattleName}","players":${playersJson},"gameCreator":"${finalAutoBattle.creatorName}"${senseiPayload}}]]></body></msg>\x00`;
-            broadcastToBattle(autoBattleName, gameStartMsg);
+            broadcastToBattle(autoBattleName, _xt(Object.assign({
+                _cmd: 'playerJoinAutoBattle', battleName: autoBattleName, username: socket.userName,
+                userRefId: joinRefId, gameCreator: gameCreator, gameCreatorId: gameCreatorId,
+            }, senseiP)));
 
-            // Response: joinedAutoBattle so client does not get gameStarted twice. Client gets both from broadcast in correct order.
-            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"joinedAutoBattle","battleName":"${autoBattleName}","gameCreator":"${gameCreator}","gameCreatorId":"${gameCreatorId}"${senseiPayload}}]]></body></msg>\x00`;
+            broadcastToBattle(autoBattleName, _xt(Object.assign({
+                _cmd: 'gameStarted', battleName: autoBattleName, players: pJson, gameCreator: fab.creatorName,
+            }, senseiP)));
+
+            response = _xt(Object.assign({
+                _cmd: 'joinedAutoBattle', battleName: autoBattleName, gameCreator: gameCreator, gameCreatorId: gameCreatorId,
+            }, senseiP));
+            break;
+        }
+
+        case 'setGameSwarmValue': {
+            const newSwarmValue = params.gameSwarmValue || 1000;
+            const currentBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
+            if (currentBattle && currentBattle.creator === socket.playerId) {
+                currentBattle.gameSwarmValue = newSwarmValue;
+                broadcastToBattle(currentBattle.name, _xt({ _cmd: 'gameSwarmValueSet', battleName: currentBattle.name, gameSwarmValue: newSwarmValue }), socket.playerId);
+                response = _xt({ _cmd: 'gameSwarmValueSet', battleName: currentBattle.name, gameSwarmValue: newSwarmValue });
+            } else {
+                response = _xt({ _cmd: 'gameError' });
+            }
+            break;
+        }
+
+        case 'setAttack':
+            response = _xt({ _cmd: 'attackSet', attackId: params.attackId || 0 });
+            break;
+        case 'setSelectedNanovor':
+        case 'selectNanovor':
+            response = _xt({ _cmd: 'nanovorSelected', nanovorId: params.nanovorId || 0 });
+            break;
+        case 'setEnemy':
+            response = _xt({ _cmd: 'enemyTargetSet' });
+            break;
+        case 'declinedToWatch':
+            response = _xt({ _cmd: 'declinedToWatchConfirmed', userRefId: params.userRefId || '' });
+            break;
+        case 'performAttack':
+            response = _xt({ _cmd: 'attackPerformed', attackId: params.attackId || 0 });
             break;
 
-        case 'allPlayersReady':
-            // Signal all players are ready
-            const readyCheckBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (readyCheckBattle) {
-                // Check if all players are ready
-                const allPlayersReady = readyCheckBattle.players.every(p => p.ready);
-
-                if (allPlayersReady) {
-                    // Start the game if all players are ready
-                    readyCheckBattle.gameState = 'in_progress';
-
-                    // Set up turn order and ensure default swarm for humans
-                    readyCheckBattle.turnOrder = [...readyCheckBattle.players];
-                    readyCheckBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(readyCheckBattle, idx); });
-
-                    const senseiPayload = isSenseiBattle(readyCheckBattle) ? ',"isSenseiBattle":true' : '';
-                    const readyPlayersJson = JSON.stringify(playersForClient(readyCheckBattle));
-                    console.log(`[GAMEXT_LOG] allPlayersReady gameStarted players:`, readyPlayersJson);
-                    const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${readyCheckBattle.name}","players":${readyPlayersJson},"gameCreator":"${readyCheckBattle.creatorName}"${senseiPayload}}]]></body></msg>\x00`;
-
-                    broadcastToBattle(readyCheckBattle.name, gameStartMsg);
-
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"allPlayersReady","battleStarted":true}]]></body></msg>\x00`;
+        case 'kickPlayerOut': {
+            const usernameToKick = params.username;
+            const kickBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
+            if (kickBattle && kickBattle.creator === socket.playerId) {
+                const pIdx = kickBattle.players.findIndex(p => p.name === usernameToKick);
+                if (pIdx !== -1) {
+                    const kicked = kickBattle.players[pIdx];
+                    sendMessageToUser(kicked.id, _xt({ _cmd: 'playerKickedOut', userRefId: kicked.id }));
+                    kickBattle.players.splice(pIdx, 1);
+                    if (kickBattle.players.length <= 1) {
+                        kickBattle.gameState = 'finished';
+                        broadcastToBattle(kickBattle.name, _xt({ _cmd: 'gameOver', winnerId: kickBattle.players[0]?.id || '' }));
+                    } else {
+                        broadcastToBattle(kickBattle.name, _xt({ _cmd: 'playerQuitGame', userRefId: kicked.id, username: kicked.name }));
+                    }
+                    response = _xt({ _cmd: 'playerKickedOut', userRefId: kicked.id });
                 } else {
-                    response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"allPlayersReady","battleStarted":false}]]></body></msg>\x00`;
+                    response = _xt({ _cmd: 'gameError' });
                 }
             } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
+                response = _xt({ _cmd: 'gameError' });
             }
             break;
-
-        case 'waitingForPlayers':
-            // Indicate waiting for players state
-            const waitingBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (waitingBattle) {
-                waitingBattle.gameState = 'waiting_for_players';
-
-                // Notify all players that we're waiting for more players
-                const waitingMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"waitingForPlayers","battleName":"${waitingBattle.name}","currentPlayers":${waitingBattle.players.length},"maxPlayers":${waitingBattle.maxPlayers}}]}</body></msg>\x00`;
-
-                broadcastToBattle(waitingBattle.name, waitingMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"waitingForPlayers","battleName":"${waitingBattle.name}","currentPlayers":${waitingBattle.players.length}}]}</body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'gameStarted':
-            // Confirm game has started
-            const startedBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (startedBattle) {
-                startedBattle.gameState = 'in_progress';
-
-                // Set up turn order and ensure default swarm for humans
-                startedBattle.turnOrder = [...startedBattle.players];
-                startedBattle.players.forEach((p, idx) => { ensureDefaultSwarmForPlayer(startedBattle, idx); });
-
-                const senseiPayload = isSenseiBattle(startedBattle) ? ',"isSenseiBattle":true' : '';
-                // Send game started message to all players (include selectedSwarmIds)
-                const gameStartMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startedBattle.name}","players":${JSON.stringify(playersForClient(startedBattle))},"gameCreator":"${startedBattle.creatorName}"${senseiPayload}}]]></body></msg>\x00`;
-
-                broadcastToBattle(startedBattle.name, gameStartMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameStarted","battleName":"${startedBattle.name}","players":${JSON.stringify(playersForClient(startedBattle))}${senseiPayload}}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'gameSwarmValueSet':
-            // Confirm swarm value is set
-            const swarmValue = params.gameSwarmValue;
-            const swarmValueBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (swarmValueBattle) {
-                swarmValueBattle.gameSwarmValue = swarmValue;
-
-                // Notify other players of the change
-                const swarmValueSetMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameSwarmValueSet","battleName":"${swarmValueBattle.name}","gameSwarmValue":${swarmValue}}]}</body></msg>\x00`;
-
-                broadcastToBattle(swarmValueBattle.name, swarmValueSetMsg, socket.playerId);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameSwarmValueSet","battleName":"${swarmValueBattle.name}","gameSwarmValue":${swarmValue}}]}</body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'swarmSelected':
-            // Confirm swarm selection
-            const swarmCount = params.swarmCount;
-            const username = params.username;
-            const userRefId = params.userRefId;
-            const swarmSelectBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (swarmSelectBattle) {
-                // Notify other players that this player has set their swarm
-                const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${swarmSelectBattle.name}","swarmCount":${swarmCount},"username":"${username}","userRefId":"${userRefId}"}]]></body></msg>\x00`;
-
-                broadcastToBattle(swarmSelectBattle.name, swarmSelectedMsg, socket.playerId);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${swarmSelectBattle.name}","swarmCount":${swarmCount},"username":"${username}","userRefId":"${userRefId}"}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'targetSelected':
-            // Confirm target selection
-            const userRefIdTarget = params.userRefId;
-            const selectedTargetUserRefId = params.targetUserRefId;
-            const attackIdTarget = params.attackId;
-            const targetSelectBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (targetSelectBattle) {
-                // Find the player who selected the target
-                const playerIndex = targetSelectBattle.players.findIndex(p => p.id === userRefIdTarget);
-                if (playerIndex !== -1) {
-                    targetSelectBattle.players[playerIndex].enemyTarget = selectedTargetUserRefId;
-                }
-
-                // Send target selected notification to all players
-                const targetSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"targetSelected","userRefId":"${userRefIdTarget}","targetUserRefId":"${selectedTargetUserRefId}","attackId":${attackIdTarget}}]}</body></msg>\x00`;
-
-                broadcastToBattle(targetSelectBattle.name, targetSelectedMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"targetSelected","userRefId":"${userRefIdTarget}","targetUserRefId":"${selectedTargetUserRefId}","attackId":${attackIdTarget}}]}</body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'readyForTurn':
-            // Signal player is ready for turn
-            const nanovorIdTurn = params.nanovorId;
-            const isDead = params.isDead;
-            const turnBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (turnBattle) {
-                // Send ready for turn notification to the player
-                const readyForTurnMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"readyForTurn","battleName":"${turnBattle.name}","nanovorId":${nanovorIdTurn},"isDead":${isDead}}]}</body></msg>\x00`;
-
-                socket.write(readyForTurnMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"readyForTurn","battleName":"${turnBattle.name}","nanovorId":${nanovorIdTurn},"isDead":${isDead}}]}</body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'roundCompleted':
-            // Report round completion
-            const roundNum = params.round;
-            const roundCompleteBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (roundCompleteBattle) {
-                // Increment round number
-                roundCompleteBattle.round = roundNum || roundCompleteBattle.round + 1;
-
-                // Reset turn counter for the new round
-                roundCompleteBattle.currentTurn = 0;
-
-                // Send round completed notification to all players
-                const roundCompleteMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"roundCompleted","round":${roundCompleteBattle.round}}]}</body></msg>\x00`;
-
-                broadcastToBattle(roundCompleteBattle.name, roundCompleteMsg);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"roundCompleted","round":${roundCompleteBattle.round}}]}</body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'playerQuitGame':
-            // Report player quit
-            const quitUserId = params.userRefId;
-            const quitUsername = params.username;
-            const quitGameBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (quitGameBattle) {
-                // Remove player from the battle
-                quitGameBattle.players = quitGameBattle.players.filter(p => p.id !== quitUserId);
-
-                // If there's only one player left, end the game
-                if (quitGameBattle.players.length <= 1) {
-                    quitGameBattle.gameState = 'finished';
-
-                    // Notify remaining players that the game is over
-                    const gameOverMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameOver","winnerId":"${quitGameBattle.players[0]?.id || ''}","results":"Game ended due to player quit"}]]></body></msg>\x00`;
-
-                    broadcastToBattle(quitGameBattle.name, gameOverMsg);
-                } else {
-                    // Notify other players that someone quit
-                    const playerQuitMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerQuitGame","userRefId":"${quitUserId}","username":"${quitUsername}"}]]></body></msg>\x00`;
-
-                    broadcastToBattle(quitGameBattle.name, playerQuitMsg);
-                }
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"playerQuitConfirmed","userRefId":"${quitUserId}","username":"${quitUsername}"}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'gameOver':
-            console.log(`[GAMEXT_LOG] gameOver command called by user ${socket.userId} (${socket.userName})`, params);
-            // Report game over
-            const winnerId = params.winnerId;
-            const results = params.results;
-            const gameOverBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
-
-            if (gameOverBattle) {
-                gameOverBattle.gameState = 'finished';
-                console.log(`[GAMEXT_LOG] gameOver - battle ${gameOverBattle.name} finished, winner: ${winnerId}, results: ${results}`);
-
-                // Notify all players that the game is over
-                const gameOverMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameOver","winnerId":"${winnerId}","results":"${results}"}]]></body></msg>\x00`;
-
-                broadcastToBattle(gameOverBattle.name, gameOverMsg);
-
-                // Update user stats based on game results
-                if (users[winnerId]) {
-                    users[winnerId].gamesWon = (users[winnerId].gamesWon || 0) + 1;
-                    users[winnerId].gamesPlayed = (users[winnerId].gamesPlayed || 0) + 1;
-                    console.log(`[GAMEXT_LOG] gameOver - updated stats for winner ${winnerId}: wins=${users[winnerId].gamesWon}, games=${users[winnerId].gamesPlayed}`);
-
-                    // Save user data after updating stats
-                    saveUserData(winnerId);
-                }
-
-                // Clean up the battle room
-                delete battleRooms[gameOverBattle.name];
-                console.log(`[GAMEXT_LOG] gameOver - cleaned up battle room ${gameOverBattle.name}`);
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameOver","winnerId":"${winnerId}","results":"${results}"}]]></body></msg>\x00`;
-            } else {
-                console.log(`[GAMEXT_LOG] gameOver failed - no active battle for user ${socket.userId}`);
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
-
-        case 'roomDestroyed':
-            // Report room destroyed
-            const roomName = params.roomName;
-            const destroyBattle = roomName ? battleRooms[roomName] : null;
-
-            if (destroyBattle) {
-                // Notify all players in the battle that the room is destroyed
-                const roomDestroyMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"roomDestroyed"}]}</body></msg>\x00`;
-
-                broadcastToBattle(roomName, roomDestroyMsg);
-
-                // Clean up the battle room
-                delete battleRooms[roomName];
-
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"roomDestroyed","roomName":"${roomName}"}]]></body></msg>\x00`;
-            } else {
-                response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
-            }
-            break;
+        }
 
         default:
-            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"unknownCommand"}]]></body></msg>\x00`;
+            response = _xt({ _cmd: 'unknownCommand' });
     }
 
-    // Only send response if it's not handled by a specific case that sends its own messages
-    if (response && !response.includes('invitationSent') && !response.includes('invitationRequest')) {  // Some responses are sent separately
-        socket.write(response);
-    }
+    if (response) socket.write(response);
 }
-
 
 module.exports = handleGameXtCommand;

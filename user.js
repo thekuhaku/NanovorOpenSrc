@@ -7,7 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const state = require('./state');
 
-const { users, sessions, getNextAccountId, setNextAccountIdIfHigher, getNextEmAssetId, setNextEmAssetIdIfHigher } = state;
+const { users, sessions, getNextAccountId, setNextAccountIdIfHigher, getNextEmAssetId, setNextEmAssetIdIfHigher, buddies } = state;
 
 const USER_DATA_DIR = path.join(__dirname, 'UserData');
 
@@ -131,6 +131,13 @@ function loadUserDataByUsername(username) {
         }
         users[accountId] = data;
         if (data.id !== accountId) data.id = accountId;
+        // Restore buddy list
+        if (Array.isArray(data.buddyList)) {
+            if (!buddies[accountId]) buddies[accountId] = new Set();
+            for (const bid of data.buddyList) {
+                buddies[accountId].add(Number(bid));
+            }
+        }
         saveUserData(accountId);
         return data;
     } catch (err) {

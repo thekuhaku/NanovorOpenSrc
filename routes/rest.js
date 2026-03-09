@@ -2,16 +2,267 @@ const path = require('path');
 const fs = require('fs');
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
+const { parseString } = require('xml2js');
 const state = require('../state');
 const user = require('../user');
 const utils = require('../lib/utils');
+const virmonData = require('../game/virmonData');
 const { users, sessions, getNextAccountId, getNextEmAssetId } = state;
 const { findSessionByToken, createUserProfile, saveUserData, loadUserDataByUsername, loadUserData } = user;
 const { generateToken, formatDateForNanovor } = utils;
 
+const DATA_DIR = path.join(__dirname, '..', 'data');
+
 function parseAccountId(param) {
     const id = parseInt(param, 10);
     return Number.isNaN(id) ? null : id;
+}
+
+function parseAccountId(param) {
+    const id = parseInt(param, 10);
+    return Number.isNaN(id) ? null : id;
+}
+
+// 式式式 Evolution Helpers 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
+
+let _evolutionSolutions = null;
+function _getEvolutionSolutions() {
+    if (_evolutionSolutions) return _evolutionSolutions;
+    const solutionsPath = path.join(DATA_DIR, 'evolution_minigame_solutions.json');
+    try {
+        if (fs.existsSync(solutionsPath)) {
+            _evolutionSolutions = JSON.parse(fs.readFileSync(solutionsPath, 'utf8'));
+            return _evolutionSolutions;
+        }
+    } catch (e) {
+        console.error(`[Evolution] Error loading solutions: ${e.message}`);
+    }
+    return {};
+}
+
+function _getEvolutionInfo(evolutionId) {
+    const evoPath = path.join(DATA_DIR, 'evolution.xml');
+    if (!fs.existsSync(evoPath)) return { sourceTypeId: null, destTypeId: null };
+    try {
+        const content = fs.readFileSync(evoPath, 'utf8');
+        // Simple regex parse for evolution entries
+        const evoRegex = new RegExp(`<evolution[^>]*id="${evolutionId}"[^>]*>([\\s\\S]*?)</evolution>`, 'i');
+        // Also try: <evolution><id>123</id>...
+        let srcId = null, dstId = null;
+
+        // Parse with xml2js
+        let result = null;
+        parseString(content, { explicitArray: false, ignoreAttrs: false }, (err, parsed) => {
+            if (!err) result = parsed;
+        });
+
+        if (result) {
+            // Walk the parsed structure to find the evolution
+            const root = result.c || result.evolutions || result;
+            const evolutions = root.evolution || [];
+            const evoList = Array.isArray(evolutions) ? evolutions : [evolutions];
+            for (const evo of evoList) {
+                const eid = evo.$ && evo.$.id || evo.id || evo['evolution-id'];
+                if (String(eid) === String(evolutionId)) {
+                    srcId = parseInt(evo['source-type-id'], 10) || null;
+                    dstId = parseInt(evo['destination-type-id'], 10) || null;
+                    break;
+                }
+            }
+        }
+        return { sourceTypeId: srcId, destTypeId: dstId };
+    } catch (e) {
+        console.error(`[Evolution] Error parsing evolution.xml: ${e.message}`);
+        return { sourceTypeId: null, destTypeId: null };
+    }
+}
+
+function _findAssetInUser(accountId, assetId) {
+    const u = users[accountId];
+    if (!u) return null;
+    const inv = u.nanovorInventory || [];
+    return inv.find(n => n.id === assetId) || null;
+}
+
+function _findEmInUser(accountId, emAssetId) {
+    const u = users[accountId];
+    if (!u) return null;
+    const inv = u.emInventory || [];
+    return inv.find(e => e.id === emAssetId) || null;
+}
+
+function _handleEvolutionAttempt(res, accountId, evolutionId, body) {
+    // Parse XML body to get source-asset-id and em-asset-ids
+    let sourceAssetId = null;
+    let emAssetIds = [];
+
+    parseString(body, { explicitArray: false, ignoreAttrs: true, tagNameProcessors: [(name) => name.replace(/.*:/, '')] }, (err, parsed) => {
+        if (err || !parsed) return;
+        const root = parsed['evolution-attempt'] || parsed['c'] || parsed[Object.keys(parsed)[0]] || {};
+        sourceAssetId = parseInt(root['source-asset-id'], 10) || null;
+        const emIds = root['em-asset-id'];
+        if (Array.isArray(emIds)) {
+            emAssetIds = emIds.map(id => parseInt(id, 10)).filter(id => !isNaN(id));
+        } else if (emIds !== undefined) {
+            const id = parseInt(emIds, 10);
+            if (!isNaN(id)) emAssetIds = [id];
+        }
+    });
+
+    if (!sourceAssetId) {
+        return res.send('error:Missing source-asset-id');
+    }
+
+    const solutions = _getEvolutionSolutions();
+    const solution = solutions[String(evolutionId)];
+    if (!solution) {
+        return res.send('error:Unknown evolution id');
+    }
+
+    const { sourceTypeId, destTypeId } = _getEvolutionInfo(evolutionId);
+    if (sourceTypeId === null || destTypeId === null) {
+        return res.send('error:Invalid evolution');
+    }
+
+    const asset = _findAssetInUser(accountId, sourceAssetId);
+    if (!asset) {
+        return res.send('error:Asset not found');
+    }
+    if (asset.assetTypeId !== sourceTypeId) {
+        return res.send('error:Asset type does not match evolution');
+    }
+
+    // Resolve EM asset ids to type ids
+    const playerEmTypes = emAssetIds.map(emId => {
+        const em = _findEmInUser(accountId, emId);
+        return (em && em.assetTypeId >= 1000) ? em.assetTypeId : null;
+    });
+
+    // Check if combo matches solution
+    const matches = playerEmTypes.length === solution.length &&
+        playerEmTypes.every((t, i) => t === solution[i]);
+
+    if (matches) {
+        // Apply evolution: update asset type and reset stats
+        const virmon = virmonData.getVirmon(destTypeId);
+        if (virmon) {
+            asset.assetTypeId = destTypeId;
+            asset.name = virmon.name || asset.name;
+            asset.assetTypeName = virmon.name || asset.assetTypeName;
+            asset.speed = parseInt(virmon.base_speed, 10) || 10;
+            asset.strength = parseInt(virmon.base_strength, 10) || 100;
+            asset.armor = parseInt(virmon.base_armor, 10) || 0;
+            asset.health = parseInt(virmon.base_health, 10) || 100;
+            asset.lastEvolutionDate = new Date().toISOString();
+        } else {
+            asset.assetTypeId = destTypeId;
+        }
+        saveUserData(accountId);
+        res.set('Content-Type', 'text/plain');
+        return res.send('success');
+    }
+
+    // Wrong combo: return Mastermind-style hint
+    const solutionMax = {};
+    for (const t of solution) {
+        solutionMax[t] = (solutionMax[t] || 0) + 1;
+    }
+
+    let numCorrect = 0;
+    let numOutOfPlace = 0;
+    for (let i = 0; i < Math.min(playerEmTypes.length, solution.length); i++) {
+        if (playerEmTypes[i] !== null && playerEmTypes[i] === solution[i]) {
+            numCorrect++;
+        }
+    }
+
+    for (let i = 0; i < playerEmTypes.length; i++) {
+        if (i >= solution.length) continue;
+        const p = playerEmTypes[i];
+        if (p === null) continue;
+        if (p === solution[i]) continue; // already counted as correct
+        const maxAllowed = solutionMax[p] || 0;
+        if (maxAllowed === 0) continue; // not in solution at all
+        const usedSoFar = playerEmTypes.slice(0, i + 1).filter(t => t === p).length;
+        if (usedSoFar > maxAllowed) continue; // too many
+        numOutOfPlace++;
+    }
+
+    const hintXml = `<c><n>${numCorrect}</n><n>${numCorrect + numOutOfPlace}</n></c>`;
+    res.set('Content-Type', 'application/xml');
+    res.send(hintXml);
+}
+
+// 式式式 Booster Pack / Retail Helpers 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
+
+const WAVE1_NANOVOR_POOL = [
+    [1, 'Electropod 1.0', 13], [6, 'Tank Walker 1.0', 12], [24, 'Doom Blade 1.0', 12],
+    [11, 'Gamma Stalker 1.0', 7], [15, 'Mega Scorpion 1.0', 7], [19, 'Plasma Lash 1.0', 7],
+    [30, 'Phase Stormer 1.0', 7], [35, 'Storm Spinner 1.0', 7], [39, 'Spike Spine 1.0', 7],
+    [44, 'Gigastriker 1.0', 7], [50, 'Circuit Flyer 1.0', 7], [54, 'Battle Kraken 1.0', 7],
+];
+const _EM_WEIGHTS = [17, 17, 14, 14, 12, 24];
+const WAVE1_EM_1M = [[1007,'1M1',_EM_WEIGHTS[0]],[1008,'1M2',_EM_WEIGHTS[1]],[1009,'1M3',_EM_WEIGHTS[2]],[1010,'1M4',_EM_WEIGHTS[3]],[1011,'1M5',_EM_WEIGHTS[4]],[1012,'1M6',_EM_WEIGHTS[5]]];
+const WAVE1_EM_1V = [[1013,'1V1',_EM_WEIGHTS[0]],[1014,'1V2',_EM_WEIGHTS[1]],[1015,'1V3',_EM_WEIGHTS[2]],[1016,'1V4',_EM_WEIGHTS[3]],[1017,'1V5',_EM_WEIGHTS[4]],[1018,'1V6',_EM_WEIGHTS[5]]];
+const WAVE1_EM_1H = [[1001,'1H1',_EM_WEIGHTS[0]],[1002,'1H2',_EM_WEIGHTS[1]],[1003,'1H3',_EM_WEIGHTS[2]],[1004,'1H4',_EM_WEIGHTS[3]],[1005,'1H5',_EM_WEIGHTS[4]],[1006,'1H6',_EM_WEIGHTS[5]]];
+
+function _weightedChoice(pool) {
+    const total = pool.reduce((s, [,,w]) => s + w, 0);
+    let r = Math.floor(Math.random() * total) + 1;
+    for (const [typeId, name, weight] of pool) {
+        r -= weight;
+        if (r <= 0) return { typeId, name };
+    }
+    return { typeId: pool[pool.length - 1][0], name: pool[pool.length - 1][1] };
+}
+
+function _purchaseWave1Booster(accountId) {
+    const u = users[accountId];
+    if (!u) return false;
+    if ((u.nanocash || 0) < 50) return false;
+
+    u.nanocash -= 50;
+
+    // Grant 1 random nanovor
+    const { typeId, name: nanoName } = _weightedChoice(WAVE1_NANOVOR_POOL);
+    const virmon = virmonData.getVirmon(typeId);
+    const nano = {
+        id: getNextEmAssetId(), // reusing EM id counter for unique IDs
+        assetTypeId: typeId,
+        assetId: 0,
+        name: nanoName,
+        assetTypeName: nanoName,
+        speed: virmon ? parseInt(virmon.base_speed, 10) || 10 : 10,
+        strength: virmon ? parseInt(virmon.base_strength, 10) || 100 : 100,
+        armor: virmon ? parseInt(virmon.base_armor, 10) || 0 : 0,
+        health: virmon ? parseInt(virmon.base_health, 10) || 100 : 100,
+        birthDate: new Date().toISOString(),
+        kills: 0, deaths: 0, wins: 0, criticalHits: 0, maxDamage: 0,
+    };
+    nano.assetId = nano.id;
+    if (!u.nanovorInventory) u.nanovorInventory = [];
+    u.nanovorInventory.push(nano);
+    u.nanovorCount = u.nanovorInventory.length;
+
+    // Grant 9 EMs (3x each of 1M, 1V, 1H)
+    if (!u.emInventory) u.emInventory = [];
+    for (const pool of [WAVE1_EM_1M, WAVE1_EM_1V, WAVE1_EM_1H]) {
+        for (let i = 0; i < 3; i++) {
+            const { typeId: emTypeId, name: emName } = _weightedChoice(pool);
+            const em = {
+                id: getNextEmAssetId(),
+                assetTypeId: emTypeId,
+                assetId: 0,
+                name: emName,
+                assetTypeName: emName,
+            };
+            em.assetId = em.id;
+            u.emInventory.push(em);
+        }
+    }
+    u.ems = u.emInventory.length;
+    saveUserData(accountId);
+    return true;
 }
 
 function registerRest(app) {
@@ -887,69 +1138,108 @@ app.get('/bankfe/resources/asset/:assetId/badge', (req, res) => {
 });
 
 // Endpoint for saving/updating user profile information
-app.post('/bankfe/resources/account/:accountId/profile', (req, res) => {
+app.post('/bankfe/resources/account/:accountId/profile', express.text({ type: '*/*', limit: '10mb' }), (req, res) => {
     const accountId = parseAccountId(req.params.accountId);
     if (accountId === null) return res.status(400).send('Invalid account ID');
     const auth = req.query.auth;
 
-    console.log(`[${new Date().toISOString()}] Account profile update request for ${accountId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers, 'Body:', req.body.toString());
-
-    // Verify token
     const session = findSessionByToken(auth);
     if (!session || session.accountId !== accountId) {
-        console.log(`[${new Date().toISOString()}] Invalid token for account profile update request - session: ${session ? session.accountId : 'none'}, accountId: ${accountId}`);
         return res.status(401).send('<error>Invalid token</error>');
     }
 
-    // Parse the profile data from the request
-    const profileData = req.body.toString();
-    console.log(`[${new Date().toISOString()}] Profile update data: ${profileData}`);
+    const body = req.body ? req.body.toString() : '';
+    parseString(body, { explicitArray: false, ignoreAttrs: true, tagNameProcessors: [(name) => name.replace(/.*:/, '')] }, (err, parsed) => {
+        if (err || !parsed) {
+            return res.send('error:Invalid request body');
+        }
+        const root = parsed['account-profile'] || parsed[Object.keys(parsed)[0]] || {};
+        const avatarIdStr = root['avatar-id'];
+        if (avatarIdStr === undefined || avatarIdStr === null || String(avatarIdStr).trim() === '') {
+            return res.send('error:Missing avatar-id');
+        }
+        const avatarId = parseInt(avatarIdStr, 10);
+        if (isNaN(avatarId)) {
+            return res.send('error:Invalid avatar-id');
+        }
 
-    // Update user profile
-    if (users[accountId]) {
-        // This is a simplified update - in a real implementation you'd parse the XML
-        // and update specific fields
-        console.log(`[${new Date().toISOString()}] Updated profile for user ${accountId}`);
-    }
+        const u = users[accountId];
+        if (u) {
+            u.avatarId = avatarId;
+            const phoneNumber = root['phone-number'];
+            if (phoneNumber !== undefined && phoneNumber !== null) {
+                u.phoneNumber = String(phoneNumber).trim();
+            }
+            saveUserData(accountId);
+        }
 
-    // Return success response
-    const response = `<profile-update-success xmlns="http://127.0.0.1:8443/xsd/account/profile-update-success.xsd"/>`;
-
-    console.log(`[${new Date().toISOString()}] Sending profile update success response for ${accountId}`);
-    res.set('Content-Type', 'application/xml');
-    res.send(response);
+        res.set('Content-Type', 'application/xml');
+        res.send('<ok/>');
+    });
 });
 
 // Asset jolt spend endpoint
-app.post('/bankfe/resources/asset/:assetId/jolt', (req, res) => {
-    const assetId = req.params.assetId;
+app.post('/bankfe/resources/asset/:assetId/jolt', express.text({ type: '*/*', limit: '10mb' }), (req, res) => {
+    const assetId = parseInt(req.params.assetId, 10);
     const auth = req.query.auth;
 
-    console.log(`[${new Date().toISOString()}] Asset jolt spend request for asset ${assetId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers, 'Body:', req.body.toString());
-
-    // Verify token
     const session = findSessionByToken(auth);
     if (!session) {
-        console.log(`[${new Date().toISOString()}] Invalid token for asset jolt spend request - auth: ${auth}`);
         return res.status(401).send('<error>Invalid token</error>');
     }
 
-    // Parse the jolt spend data from the request
-    const joltSpendData = req.body.toString();
-    console.log(`[${new Date().toISOString()}] Jolt spend data: ${joltSpendData}`);
+    const accountId = session.accountId;
+    const u = users[accountId];
+    if (!u) {
+        return res.status(404).send('<error>User not found</error>');
+    }
 
-    // For now, just acknowledge the request
-    // In a real implementation, you would parse the XML and update the asset's stats
-    console.log(`[${new Date().toISOString()}] Processed jolt spend for asset ${assetId}`);
+    const body = req.body ? req.body.toString() : '';
+    parseString(body, { explicitArray: false, ignoreAttrs: true, tagNameProcessors: [(name) => name.replace(/.*:/, '')] }, (err, parsed) => {
+        if (err || !parsed) {
+            return res.send('error:Invalid request body');
+        }
+        const root = parsed['jolt-spend'] || parsed[Object.keys(parsed)[0]] || {};
+        const armorDelta = parseInt(root['armor-delta'], 10) || 0;
+        const healthDelta = parseInt(root['health-delta'], 10) || 0;
+        const speedDelta = parseInt(root['speed-delta'], 10) || 0;
+        const strengthDelta = parseInt(root['strength-delta'], 10) || 0;
 
-    // Return success response
-    const response = `<jolt-spend-success xmlns="http://127.0.0.1:8443/xsd/jolt-spend/jolt-spend-success.xsd"/>`;
+        // Check jolt balances
+        const joltArmor = u.joltArmorBalance || 5;
+        const joltHealth = u.joltHealthBalance || 5;
+        const joltSpeed = u.joltSpeedBalance || 5;
+        const joltStrength = u.joltStrengthBalance || 5;
 
-    console.log(`[${new Date().toISOString()}] Sending jolt spend success response for asset ${assetId}`);
-    res.set('Content-Type', 'application/xml');
-    res.send(response);
+        if (armorDelta > joltArmor || healthDelta > joltHealth ||
+            speedDelta > joltSpeed || strengthDelta > joltStrength) {
+            return res.send('error:Insufficient jolt balance');
+        }
+
+        // Find the asset in user's inventory
+        const nanovor = (u.nanovorInventory || []).find(n => n.id === assetId);
+        if (!nanovor) {
+            return res.send('error:Asset not found');
+        }
+
+        // Deduct jolt balances
+        u.joltArmorBalance = joltArmor - armorDelta;
+        u.joltHealthBalance = joltHealth - healthDelta;
+        u.joltSpeedBalance = joltSpeed - speedDelta;
+        u.joltStrengthBalance = joltStrength - strengthDelta;
+
+        // Apply stat boosts
+        nanovor.armor = (nanovor.armor || 0) + armorDelta;
+        nanovor.health = (nanovor.health || 100) + healthDelta;
+        nanovor.speed = (nanovor.speed || 10) + speedDelta;
+        nanovor.strength = (nanovor.strength || 100) + strengthDelta;
+
+        saveUserData(accountId);
+        console.log(`[${new Date().toISOString()}] Jolt spend applied to asset ${assetId}: armor+${armorDelta}, health+${healthDelta}, speed+${speedDelta}, strength+${strengthDelta}`);
+
+        res.set('Content-Type', 'application/xml');
+        res.send(`<jolt-spend-success/>`);
+    });
 });
 
 // Account activity endpoint for determining new user status
@@ -1175,77 +1465,139 @@ ${assetsXml}
 
 // Asset miscellany endpoint - for nickname and other asset-specific data
 app.get('/bankfe/resources/asset/:assetId/miscellany', (req, res) => {
-    const assetId = req.params.assetId;
+    const assetId = parseInt(req.params.assetId, 10);
     const auth = req.query.auth;
 
-    console.log(`[${new Date().toISOString()}] Asset miscellany request for asset ${assetId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers);
-
-    // Verify token
     const session = findSessionByToken(auth);
     if (!session) {
-        console.log(`[${new Date().toISOString()}] Invalid token for asset miscellany request - auth: ${auth}`);
         return res.status(401).send('<error>Invalid token</error>');
     }
 
-    // Return asset miscellany info (placeholder for nickname editor functionality)
-    const miscellanyInfo = `
-<asset-miscellany xmlns="http://127.0.0.1:8443/xsd/asset-miscellany/asset-miscellany.xsd">
-</asset-miscellany>`;
+    // Find the asset across all users to get its nickname
+    const accountId = session.accountId;
+    const u = users[accountId];
+    let nickname = '';
+    if (u) {
+        const nanovor = (u.nanovorInventory || []).find(n => n.id === assetId);
+        if (nanovor) {
+            nickname = nanovor.nickname || '';
+        }
+    }
 
-    console.log(`[${new Date().toISOString()}] Sending asset miscellany response for asset ${assetId}`);
     res.set('Content-Type', 'application/xml');
-    res.send(miscellanyInfo);
+    res.send(`<asset-miscellany><nickname>${nickname}</nickname></asset-miscellany>`);
 });
 
-// Evolution list endpoint - returns all available evolutions for the user
+// Asset miscellany POST - update nickname
+app.post('/bankfe/resources/asset/:assetId/miscellany', express.text({ type: '*/*', limit: '10mb' }), (req, res) => {
+    const assetId = parseInt(req.params.assetId, 10);
+    const auth = req.query.auth;
+
+    const session = findSessionByToken(auth);
+    if (!session) {
+        return res.status(401).send('<error>Invalid token</error>');
+    }
+
+    const accountId = session.accountId;
+    const u = users[accountId];
+    if (!u) {
+        return res.send('error:User not found');
+    }
+
+    const body = req.body ? req.body.toString() : '';
+    parseString(body, { explicitArray: false, ignoreAttrs: true, tagNameProcessors: [(name) => name.replace(/.*:/, '')] }, (err, parsed) => {
+        if (err || !parsed) {
+            return res.send('error:Invalid request body');
+        }
+        const root = parsed['asset-miscellany'] || parsed[Object.keys(parsed)[0]] || {};
+        const nickname = (root.nickname !== undefined && root.nickname !== null)
+            ? String(root.nickname).trim()
+            : '';
+
+        const nanovor = (u.nanovorInventory || []).find(n => n.id === assetId);
+        if (!nanovor) {
+            return res.send('error:Asset not found');
+        }
+
+        nanovor.nickname = nickname;
+        saveUserData(accountId);
+        console.log(`[${new Date().toISOString()}] Nickname updated for asset ${assetId}: "${nickname}"`);
+
+        res.set('Content-Type', 'application/xml');
+        res.send('<ok/>');
+    });
+});
+
+// Evolution list endpoint - returns all available evolutions
 app.get('/bankfe/resources/evolution', (req, res) => {
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Evolution list request, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers);
 
-    // Verify token
     const session = findSessionByToken(auth);
     if (!session) {
-        console.log(`[${new Date().toISOString()}] Invalid token for evolution list request - auth: ${auth}`);
         return res.status(401).send('<error>Invalid token</error>');
     }
 
-    // Return evolution list (placeholder)
-    const evolutionList = `
-<evolution-list xmlns="http://127.0.0.1:8443/xsd/evolution/evolution-list.xsd">
-</evolution-list>`;
-
-    console.log(`[${new Date().toISOString()}] Sending evolution list response`);
-    res.set('Content-Type', 'application/xml');
-    res.send(evolutionList);
+    // Serve evolution.xml from data directory
+    const evoPath = path.join(DATA_DIR, 'evolution.xml');
+    try {
+        if (fs.existsSync(evoPath)) {
+            const content = fs.readFileSync(evoPath, 'utf8');
+            res.set('Content-Type', 'application/xml');
+            res.send(content);
+        } else {
+            res.set('Content-Type', 'application/xml');
+            res.send('<c></c>');
+        }
+    } catch (e) {
+        console.error(`[Evolution] Error loading evolution.xml: ${e.message}`);
+        res.set('Content-Type', 'application/xml');
+        res.send('<c></c>');
+    }
 });
 
-// Specific evolution endpoint - handles evolution attempts
+// Specific evolution endpoint - handles GET and POST evolution attempts
 app.get('/bankfe/resources/evolution/:evolutionId', (req, res) => {
     const evolutionId = req.params.evolutionId;
     const auth = req.query.auth;
 
-    console.log(`[${new Date().toISOString()}] Specific evolution request for ${evolutionId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers);
-
-    // Verify token
     const session = findSessionByToken(auth);
     if (!session) {
-        console.log(`[${new Date().toISOString()}] Invalid token for specific evolution request - auth: ${auth}`);
         return res.status(401).send('<error>Invalid token</error>');
     }
 
-    // Return evolution data (placeholder)
-    const evolutionData = `
-<evolution xmlns="http://127.0.0.1:8443/xsd/evolution/evolution.xsd">
-  <evolution-id>${evolutionId}</evolution-id>
-</evolution>`;
+    // Return the evolution tree data
+    const evoPath = path.join(DATA_DIR, 'evolution.xml');
+    try {
+        if (fs.existsSync(evoPath)) {
+            const content = fs.readFileSync(evoPath, 'utf8');
+            res.set('Content-Type', 'application/xml');
+            res.send(content);
+        } else {
+            res.set('Content-Type', 'application/xml');
+            res.send('<c></c>');
+        }
+    } catch (e) {
+        res.set('Content-Type', 'application/xml');
+        res.send('<c></c>');
+    }
+});
 
-    console.log(`[${new Date().toISOString()}] Sending specific evolution response for ${evolutionId}`);
-    res.set('Content-Type', 'application/xml');
-    res.send(evolutionData);
+// POST evolution attempt - validate minigame combo and apply evolution or return hint
+app.post('/bankfe/resources/evolution/:evolutionId', express.text({ type: '*/*', limit: '10mb' }), (req, res) => {
+    const evolutionId = req.params.evolutionId;
+    const auth = req.query.auth;
+
+    const session = findSessionByToken(auth);
+    if (!session) {
+        return res.status(401).send('<error>Invalid token</error>');
+    }
+
+    const accountId = session.accountId;
+    const body = req.body ? req.body.toString() : '';
+
+    _handleEvolutionAttempt(res, accountId, evolutionId, body);
 });
 
 // Retail/SKU resources endpoint for nanoMall
@@ -1253,23 +1605,28 @@ app.get('/bankfe/resources/retail', (req, res) => {
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] Retail/SKU list request, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers);
 
-    // Verify token
     const session = findSessionByToken(auth);
     if (!session) {
-        console.log(`[${new Date().toISOString()}] Invalid token for retail/SKU list request - auth: ${auth}`);
         return res.status(401).send('<error>Invalid token</error>');
     }
 
-    // Return available SKUs (placeholder)
-    const skuList = `
-<sku-list xmlns="http://127.0.0.1:8443/xsd/retail/sku-list.xsd">
-</sku-list>`;
-
-    console.log(`[${new Date().toISOString()}] Sending retail/SKU list response`);
-    res.set('Content-Type', 'application/xml');
-    res.send(skuList);
+    // Serve retail.xml from data directory
+    const retailPath = path.join(DATA_DIR, 'retail.xml');
+    try {
+        if (fs.existsSync(retailPath)) {
+            const content = fs.readFileSync(retailPath, 'utf8');
+            res.set('Content-Type', 'application/xml');
+            res.send(content);
+        } else {
+            res.set('Content-Type', 'application/xml');
+            res.send('<sku-list></sku-list>');
+        }
+    } catch (e) {
+        console.error(`[Retail] Error loading retail.xml: ${e.message}`);
+        res.set('Content-Type', 'application/xml');
+        res.send('<sku-list></sku-list>');
+    }
 });
 
 // Specific SKU purchase endpoint
@@ -1278,25 +1635,42 @@ app.post('/bankfe/resources/retail/:skuId', (req, res) => {
     const auth = req.query.auth;
 
     console.log(`[${new Date().toISOString()}] SKU purchase request for ${skuId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers, 'Body:', req.body.toString());
 
-    // Verify token
     const session = findSessionByToken(auth);
     if (!session) {
-        console.log(`[${new Date().toISOString()}] Invalid token for SKU purchase request - auth: ${auth}`);
         return res.status(401).send('<error>Invalid token</error>');
     }
 
-    // Process SKU purchase (placeholder)
-    const purchaseResponse = `
-<purchase-response xmlns="http://127.0.0.1:8443/xsd/retail/purchase-response.xsd">
-  <success>true</success>
-  <sku-id>${skuId}</sku-id>
-</purchase-response>`;
+    const accountId = session.accountId;
 
-    console.log(`[${new Date().toISOString()}] Sending SKU purchase response for ${skuId}`);
-    res.set('Content-Type', 'application/xml');
-    res.send(purchaseResponse);
+    if (skuId === '58') {
+        // Wave 1 Booster Pack
+        if (_purchaseWave1Booster(accountId)) {
+            // Return updated asset list so client refreshes inventory
+            const u = users[accountId];
+            const nanovorList = u.nanovorInventory || [];
+            const emList = u.emInventory || [];
+            let assetsXml = '';
+            for (const nanovor of nanovorList) {
+                const assetTypeId = nanovor.assetTypeId ?? 1;
+                const assetTypeName = nanovor.name || 'Unknown Nanovor';
+                const birthDate = nanovor.birthDate || formatDateForNanovor(new Date());
+                const lastEvolutionDate = nanovor.lastEvolutionDate || formatDateForNanovor(new Date());
+                assetsXml += `<asset id="${nanovor.id}"><asset-type-category>virmon</asset-type-category><asset-type-id>${assetTypeId}</asset-type-id><asset-type-name>${assetTypeName}</asset-type-name><production-number>${nanovor.productionNumber || 1}</production-number><birth-date>${birthDate}</birth-date><last-evolution-date>${lastEvolutionDate}</last-evolution-date></asset>`;
+            }
+            for (const em of emList) {
+                assetsXml += `<asset id="${em.id}"><asset-type-category>em</asset-type-category><asset-type-id>${em.assetTypeId}</asset-type-id><asset-type-name>${em.name || em.assetTypeName || ''}</asset-type-name><production-number>1</production-number></asset>`;
+            }
+            res.set('Content-Type', 'application/xml');
+            res.send(`<?xml version="1.0"?><c>${assetsXml}</c>`);
+        } else {
+            res.set('Content-Type', 'application/xml');
+            res.send('<?xml version="1.0"?><c><error>Not enough Nanocash or purchase failed</error></c>');
+        }
+    } else {
+        res.set('Content-Type', 'application/xml');
+        res.send('<?xml version="1.0"?><c><error>SKU not available</error></c>');
+    }
 });
 
 
