@@ -154,7 +154,7 @@ function loadUserData(accountId) {
         if (!fs.existsSync(USER_DATA_DIR)) return null;
         const files = fs.readdirSync(USER_DATA_DIR).filter(f => f.endsWith('.json'));
         for (const f of files) {
-            const username = f.replace(/\.json$/, '');
+            const _username = f.replace(/\.json$/, '');
             const raw = fs.readFileSync(path.join(USER_DATA_DIR, f), 'utf8');
             const data = JSON.parse(raw);
             const fileId = typeof data.id === 'number' ? data.id : parseInt(data.id, 10);

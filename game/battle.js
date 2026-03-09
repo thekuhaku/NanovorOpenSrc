@@ -120,7 +120,7 @@ function evalFormula(formula, myNano, enemyNano, statementBaseDamage) {
     const substituted = _substituteVars(formula, myNano, enemyNano, statementBaseDamage);
     try {
         return _safeEval(substituted);
-    } catch (e) {
+    } catch (_e) {
         return 0;
     }
 }
@@ -165,7 +165,7 @@ function hasSpike(activeOverrides, spikeType) {
         if ((ov.stat || '') === spikeType) {
             try {
                 if (parseFloat(ov.statement_formula || '0') > 0) return true;
-            } catch (e) { /* ignore */ }
+            } catch (_e) { /* ignore */ }
         }
     }
     return false;
@@ -269,7 +269,7 @@ function getDodgeChance(activeHacks, activeOverrides) {
         if ((mod.stat || '') !== 'Dodge Fail %') continue;
         const verb = mod.verb || '';
         let value;
-        try { value = parseFloat(mod.statement_formula || '100'); } catch (e) { value = 100; }
+        try { value = parseFloat(mod.statement_formula || '100'); } catch (_e) { value = 100; }
         if (verb === '=') dodgeFailPercent = value;
         else if (verb === '+') dodgeFailPercent += value;
         else if (verb === '-') dodgeFailPercent -= value;
@@ -293,7 +293,7 @@ function isSwapBlocked(activeHacks) {
         if (hack.stat === 'Swap %' && hack.verb === '=') {
             try {
                 if (parseFloat(hack.statement_formula || '1') === 0) return true;
-            } catch (e) { /* ignore */ }
+            } catch (_e) { /* ignore */ }
         }
     }
     return false;
@@ -304,7 +304,7 @@ function isStunned(activeHacks) {
         if (hack.stat === 'Stun Fail %' && hack.verb === '=') {
             try {
                 if (parseFloat(hack.statement_formula || '1') === 0) return true;
-            } catch (e) { /* ignore */ }
+            } catch (_e) { /* ignore */ }
         }
     }
     return false;
@@ -326,7 +326,7 @@ function pickDamageStatement(statements, attackerOverrides, assetTypeId, attackI
         const attack = virmonData.getAttack(assetTypeId, attackId);
         if (attack) {
             const attackCond = ((attack.conditional || {}).name || '').toLowerCase();
-            const pickBySpike = (hasFn, failedFirstFn) => {
+            const pickBySpike = (hasFn, _failedFirstFn) => {
                 if (hasFn(attackerOverrides)) {
                     for (const s of damageCandidates) if (!_statementHasAttackFailedConditional(s)) return s;
                 } else {
@@ -441,7 +441,7 @@ function applySelfDamageFromAttack(attackerState, assetTypeId, attackId, attacke
         const target = (st.target || '').trim();
         if (target !== 'My active Virmon' && target !== 'My team') continue;
         if ((st.type || '').trim() !== 'Attack' || (st.stat || '').trim() !== 'Health') continue;
-        const verb = (st.verb || '-').trim();
+        const _verb = (st.verb || '-').trim();
         const formula = (st.statement_formula || '0').trim();
         let value;
         if (/^-?\d+\.?\d*$/.test(formula)) value = parseFloat(formula);
@@ -553,7 +553,7 @@ function getEnergyModsFromAttack(assetTypeId, attackId, attackerOverrides) {
         const targetType = st.target || '';
         const verb = st.verb || '';
         let value;
-        try { value = parseFloat(st.statement_formula || '0'); } catch (e) { value = 0; }
+        try { value = parseFloat(st.statement_formula || '0'); } catch (_e) { value = 0; }
         let change;
         if (verb === '-') change = -Math.floor(value);
         else if (verb === '+') change = Math.floor(value);
@@ -580,7 +580,7 @@ function getStatModsFromAttack(assetTypeId, attackId, attackerOverrides) {
         if (stat === 'Energy' || stat === 'Override' || stat === 'Health') continue;
         if (!checkStatementConditional(st, attackerOverrides)) continue;
         let value;
-        try { value = parseFloat(st.statement_formula || '0'); } catch (e) { value = 0; }
+        try { value = parseFloat(st.statement_formula || '0'); } catch (_e) { value = 0; }
         mods.push({
             statement_id: parseInt(st.statement_id || 0, 10),
             target: st.target || '',

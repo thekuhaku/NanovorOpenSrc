@@ -49,7 +49,7 @@ function advanceTurn(room) {
     room.currentTurn = (room.currentTurn + 1) % room.users.length;
 
     const currentPlayer = room.users[room.currentTurn];
-    const readyForTurnMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"readyForTurn","battleName":"${room.name}","nanovorId":0,"isDead":false}]]></body></msg>\x00`;
+    const _readyForTurnMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"readyForTurn","battleName":"${room.name}","nanovorId":0,"isDead":false}]]></body></msg>\x00`;
 
     console.log(`Advancing turn to player: ${currentPlayer.name} in room: ${room.name}`);
 }

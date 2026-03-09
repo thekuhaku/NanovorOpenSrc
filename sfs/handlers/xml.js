@@ -1,7 +1,7 @@
 const { parseString } = require('xml2js');
 const state = require('../../state');
 const user = require('../../user');
-const handleExtensionCommand = require('./extension');
+const _handleExtensionCommand = require('./extension');
 const { users, gameRooms, socketMap } = state;
 const { findSessionByToken, createUserProfile, saveUserData, loadUserData } = user;
 

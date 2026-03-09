@@ -8,15 +8,10 @@ const user = require('../user');
 const utils = require('../lib/utils');
 const virmonData = require('../game/virmonData');
 const { users, sessions, getNextAccountId, getNextEmAssetId } = state;
-const { findSessionByToken, createUserProfile, saveUserData, loadUserDataByUsername, loadUserData } = user;
+const { findSessionByToken, createUserProfile, saveUserData, loadUserDataByUsername } = user;
 const { generateToken, formatDateForNanovor } = utils;
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
-
-function parseAccountId(param) {
-    const id = parseInt(param, 10);
-    return Number.isNaN(id) ? null : id;
-}
 
 function parseAccountId(param) {
     const id = parseInt(param, 10);
@@ -46,7 +41,7 @@ function _getEvolutionInfo(evolutionId) {
     try {
         const content = fs.readFileSync(evoPath, 'utf8');
         // Simple regex parse for evolution entries
-        const evoRegex = new RegExp(`<evolution[^>]*id="${evolutionId}"[^>]*>([\\s\\S]*?)</evolution>`, 'i');
+        const _evoRegex = new RegExp(`<evolution[^>]*id="${evolutionId}"[^>]*>([\\s\\S]*?)</evolution>`, 'i');
         // Also try: <evolution><id>123</id>...
         let srcId = null, dstId = null;
 
@@ -1069,7 +1064,7 @@ app.get('/bankfe/resources/account/collections/:accountId', (req, res) => {
 
     // Return user's collection data from their inventory
     const nanovorList = user.nanovorInventory || [];
-    const emList = user.emInventory || [];
+    const _emList = user.emInventory || [];
 
     // Build XML for nanovor inventory
     let virmonXml = '';
@@ -1559,7 +1554,7 @@ app.get('/bankfe/resources/evolution', (req, res) => {
 
 // Specific evolution endpoint - handles GET and POST evolution attempts
 app.get('/bankfe/resources/evolution/:evolutionId', (req, res) => {
-    const evolutionId = req.params.evolutionId;
+    const _evolutionId = req.params.evolutionId;
     const auth = req.query.auth;
 
     const session = findSessionByToken(auth);
@@ -1578,7 +1573,7 @@ app.get('/bankfe/resources/evolution/:evolutionId', (req, res) => {
             res.set('Content-Type', 'application/xml');
             res.send('<c></c>');
         }
-    } catch (e) {
+    } catch (_e) {
         res.set('Content-Type', 'application/xml');
         res.send('<c></c>');
     }

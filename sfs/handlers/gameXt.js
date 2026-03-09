@@ -33,7 +33,7 @@ const SENSEI_DEFAULT_SWARMS = {
 const ATTACK_TYPE_NONE = 0;
 const ATTACK_TYPE_PASS = 1;
 const ATTACK_TYPE_FIZZLE = 4;
-const ATTACK_TYPE_TARGET_DEAD = 5;
+const _ATTACK_TYPE_TARGET_DEAD = 5; // reserved for future use
 const ATTACK_TYPE_DODGED = 8;
 
 // Swap action types
@@ -101,7 +101,7 @@ function _xt(json) {
 
 /** Send JSON extension message to a specific socket. */
 function _sendTo(socket, json) {
-    try { socket.write(_xt(json)); } catch (e) { /* ignore dead socket */ }
+    try { socket.write(_xt(json)); } catch (_e) { /* ignore dead socket */ }
 }
 
 /** Find all sockets in a battle by battleName. */

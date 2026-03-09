@@ -5,30 +5,18 @@
 
 const express = require('express');
 const http = require('http');
-const net = require('net');
-const fs = require('fs');
-const path = require('path');
-const { v4: uuidv4 } = require('uuid');
 
 // Import helper modules
-const { parseString } = require('xml2js');
-const { create } = require('xmlbuilder2');
+require('xml2js');
+require('xmlbuilder2');
 
 // Shared state and business logic (split modules)
 const state = require('./state');
-const { users, sessions, gameRooms, gameStates, socketMap, battleRooms } = state;
+const { users } = state;
 const user = require('./user');
-const srb = require('./lib/srb');
-const utils = require('./lib/utils');
 const config = require('./config');
-const gameRoomsModule = require('./gameRooms');
-const battle = require('./battle');
 
-const { findSessionByToken, createUserProfile, saveUserData, loadUserDataByUsername, loadUserData, loadAllUserData } = user;
-const { extractParamsFromRequest, createSrbResponse } = srb;
-const { generateToken } = utils;
-const { createGameRoom, getUserGameRoom, advanceTurn } = gameRoomsModule;
-const { sendMessageToUser, broadcastToBattle } = battle;
+const { saveUserData, loadAllUserData } = user;
 const virmonData = require('./game/virmonData');
 
 // Initialize Express app
@@ -48,8 +36,6 @@ app.use(express.text({ type: 'text/plain', limit: '10mb' }));
 console.log('Starting Nanovor Server...');
 
 const versionInfo = config.versionInfo;
-const connectionSettings = config.connectionSettings;
-const loginScreenConfig = config.loginScreenConfig;
 
 console.log(`Server version: ${versionInfo.major || '0'}.${versionInfo.minor || '0'}.${versionInfo.build || '0'}`);
 

@@ -520,7 +520,7 @@ function handleTradeExtension(socket, command, params) {
                 sendJson(socket, { _cmd: 'tradeError', tradeName });
                 return;
             }
-            const { tname, pair } = tnp;
+            const { pair } = tnp;
             if (!tradeStartedIds[tradeName]) tradeStartedIds[tradeName] = new Set();
             tradeStartedIds[tradeName].add(userId);
 

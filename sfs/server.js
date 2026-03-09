@@ -1,6 +1,6 @@
 const net = require('net');
-const path = require('path');
-const fs = require('fs');
+const _path = require('path');
+const _fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const state = require('../state');
 const user = require('../user');
@@ -263,7 +263,7 @@ function createSfsServer() {
 
                     // Notify remaining players that the game is over
                     for (const player of battle.players) {
-                        const gameOverMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameOver","winnerId":"${battle.players[0]?.id || ''}","results":"Game ended due to player disconnect"}]]></body></msg>\x00`;
+                        const _gameOverMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameOver","winnerId":"${battle.players[0]?.id || ''}","results":"Game ended due to player disconnect"}]]></body></msg>\x00`;
 
                         // In a real implementation, we would send this to each player's socket
                         // For now, we'll just log it
